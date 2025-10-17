@@ -1,28 +1,9 @@
-# 🐹 tg-hamster
+# tg-hamster
 
-Telegram антиспам-бот, который заставляет новых участников подтвердить, что они не боты — нажатием кнопки.  
-Если пользователь не нажимает кнопку в течение 60 секунд — удаляется и блокируется.
+Telegram bot для проверки новых участников через inline-кнопку.
 
-## 🚀 Возможности
-- Случайная фраза и иконка
-- Удаление сообщений после подтверждения
-- Бан за бездействие
-- Логирование в stdout
-- Автосборка через GitHub Actions + GoReleaser
+## Бейджики
 
-## ⚙️ Запуск
-Создайте `.env`:
-```
-BOT_TOKEN=123456789:ABCDEF-your-token
-```
-
-Локально:
-```
-go mod tidy
-go run main.go
-```
-
-Docker:
-```
-docker-compose up -d --build
-```
+[![Build](https://github.com/Teleta/tg-hamster/actions/workflows/ci.yml/badge.svg)](https://github.com/Teleta/tg-hamster/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/Teleta/tg-hamster)](https://goreportcard.com/report/github.com/Teleta/tg-hamster)
+[![Coverage](https://codecov.io/gh/Teleta/tg-hamster/branch/main/graph/badge.svg?token=YOUR_CODECOV_TOKEN)](https://codecov.io/gh/Teleta/tg-hamster)

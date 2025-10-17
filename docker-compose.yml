@@ -1,13 +1,7 @@
-version: "3.9"
+version: "3.8"
 services:
   tg-hamster:
     build: .
-    image: teleta/tg-hamster:latest
-    restart: unless-stopped
     environment:
       - BOT_TOKEN=${BOT_TOKEN}
-    deploy:
-      resources:
-        limits:
-          cpus: "0.25"
-          memory: 128M
+    restart: unless-stopped

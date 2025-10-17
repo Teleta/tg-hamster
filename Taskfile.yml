@@ -1,25 +1,12 @@
-version: '3'
-
-vars:
-  bin: "tg-hamster"
-
+version: "3"
 tasks:
-  build:
-    desc: "build binary"
+  lint:
     cmds:
-      - go build -o tg-hamster main.go
-
-  docker-build:
-    desc: "build docker image"
+      - golangci-lint run --timeout=3m
+  test:
     cmds:
-      - docker build -t teleta/tg-hamster:latest .
-
-  docker-push:
-    desc: "push docker image"
+      - go test -v -cover ./...
+  ci:
     cmds:
-      - docker push teleta/tg-hamster:latest
-
-  release:
-    desc: "run goreleaser (local)"
-    cmds:
-      - goreleaser release --rm-dist
+      - task lint
+      - task test
