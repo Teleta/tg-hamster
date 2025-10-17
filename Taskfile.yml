@@ -1,32 +1,77 @@
 version: "3"
 
-tasks:
-  build:
-    desc: "Build the bot binary"
-    cmds:
-      - go build -o bin/tg-hamster ./cmd/tg-hamster
+vars:
+  binary: "bin/tg-hamster"
+  docker_image: "teleta/tg-hamster:latest"
 
+tasks:
+  # -------------------------------
+  # Сборка бинаря
+  # -------------------------------
+  build:
+    desc: "Build tg-hamster binary"
+    cmds:
+      - mkdir -p bin
+      - go build -v -o {{.binary}} ./cmd/tg-hamster
+
+  # -------------------------------
+  # Запуск тестов
+  # -------------------------------
   test:
     desc: "Run unit tests"
     cmds:
       - go test ./... -v
 
+  # -------------------------------
+  # Линтинг
+  # -------------------------------
   lint:
     desc: "Run golangci-lint"
     cmds:
+      - |
+        if ! command -v golangci-lint >/dev/null 2>&1; then
+          echo "Installing golangci-lint..."
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+          | sh -s -- -b $(go env GOPATH)/bin v1.64.2
+        fi
       - golangci-lint run ./...
 
+  # -------------------------------
+  # Сборка Docker-образа
+  # -------------------------------
   docker-build:
     desc: "Build Docker image"
     cmds:
-      - docker build -t teleta/tg-hamster:latest .
+      - docker build -t {{.docker_image}} .
 
+  # -------------------------------
+  # Публикация Docker-образа
+  # -------------------------------
+  docker-push:
+    desc: "Push Docker image"
+    cmds:
+      - docker push {{.docker_image}}
+
+  # -------------------------------
+  # Docker Compose Up
+  # -------------------------------
   docker-up:
-    desc: "Start docker-compose"
+    desc: "Start Docker container via docker-compose"
     cmds:
       - docker-compose up -d
 
+  # -------------------------------
+  # Docker Compose Down
+  # -------------------------------
   docker-down:
-    desc: "Stop docker-compose"
+    desc: "Stop Docker container via docker-compose"
     cmds:
       - docker-compose down
+
+  # -------------------------------
+  # Очистка бинарей и временных файлов
+  # -------------------------------
+  clean:
+    desc: "Clean build artifacts"
+    cmds:
+      - rm -rf bin

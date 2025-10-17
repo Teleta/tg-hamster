@@ -1,43 +1,73 @@
-name: CI
+name: CI/CD
 
 on:
   push:
     branches: [ main ]
+    tags:
+      - 'v*.*.*' # релизы по тегам вида v1.0.0
   pull_request:
     branches: [ main ]
 
 jobs:
-  build:
+  build-and-push:
     runs-on: ubuntu-latest
+    env:
+      GOBIN: $HOME/go/bin
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      # Установка Go 1.25 для сборки и тестов
+      # ===========================
+      # Сборка и тесты (Go 1.25.3)
+      # ===========================
       - name: Set up Go 1.25
         uses: actions/setup-go@v4
         with:
           go-version: 1.25.3
 
-      - name: Build bot
-        run: go build -v ./...
+      - name: Build binary
+        run: go build -v -o bin/tg-hamster ./cmd/tg-hamster
 
-      - name: Run Tests (Go 1.25)
+      - name: Run Tests
         run: go test ./... -v
 
-      # Установка Go 1.24 для golangci-lint
+      # ===========================
+      # Линтинг (Go 1.25.1)
+      # ===========================
       - name: Set up Go 1.24 for linter
         uses: actions/setup-go@v4
         with:
-          go-version: 1.24
+          go-version: 1.25.1
 
       - name: Install golangci-lint
         run: |
           curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
-            | sh -s -- -b $HOME/go/bin v1.64.2
-          echo "$HOME/go/bin" >> $GITHUB_PATH
+            | sh -s -- -b $GOBIN v1.64.8
+          echo "$GOBIN" >> $GITHUB_PATH
           golangci-lint --version
 
-      - name: Run Linter (Go 1.24)
+      - name: Run Linter
         run: golangci-lint run ./...
+
+      # ===========================
+      # Docker Build & Push
+      # ===========================
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build Docker image
+        run: docker build -t teleta/tg-hamster:latest .
+
+      - name: Push Docker image (latest)
+        run: docker push teleta/tg-hamster:latest
+
+      - name: Tag & Push Docker image by version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          docker tag teleta/tg-hamster:latest teleta/tg-hamster:$VERSION
+          docker push teleta/tg-hamster:$VERSION

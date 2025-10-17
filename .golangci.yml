@@ -9,5 +9,5 @@ linters:
     - ineffassign
     - revive
     - errcheck
-  disable:
-    - goanalysis_metalinter
+#  disable:
+#    - goanalysis_metalinter
