@@ -1,6 +1,6 @@
 version: "3.9"
 services:
-  bot:
+  tg-hamster:
     build: .
     image: teleta/tg-hamster:latest
     restart: unless-stopped

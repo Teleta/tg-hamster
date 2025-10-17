@@ -1,4 +1,4 @@
-version: "3"
+version: '3'
 
 vars:
   bin: "tg-hamster"
@@ -7,17 +7,17 @@ tasks:
   build:
     desc: "build binary"
     cmds:
-      - go build -o ./dist/{{.bin}} main.go
+      - go build -o tg-hamster main.go
 
   docker-build:
     desc: "build docker image"
     cmds:
-      - docker build -t ${DOCKER_IMAGE:teleta/tg-hamster:latest} .
+      - docker build -t teleta/tg-hamster:latest .
 
   docker-push:
-    desc: "push docker image (set DOCKER_IMAGE and ensure docker login)"
+    desc: "push docker image"
     cmds:
-      - docker push ${DOCKER_IMAGE:teleta/tg-hamster:latest}
+      - docker push teleta/tg-hamster:latest
 
   release:
     desc: "run goreleaser (local)"
