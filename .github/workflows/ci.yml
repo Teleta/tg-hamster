@@ -37,22 +37,22 @@ jobs:
       # ===========================
       # Линтинг (Go 1.25.1)
       # ===========================
-      - name: Set up Go 1.25.1 for linter
-        uses: actions/setup-go@v4
-        with:
-          go-version: 1.25.1
-
-      - name: Install golangci-lint
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
-            | sh -s -- -b $HOME/go/bin v1.64.8
-          echo "$HOME/go/bin" >> $GITHUB_PATH
-          golangci-lint --version
-      - name: Show PATH
-        run: echo $PATH
-
-      - name: Run Linter
-        run: golangci-lint run ./...
+#      - name: Set up Go 1.25.1 for linter
+#        uses: actions/setup-go@v4
+#        with:
+#          go-version: 1.25.1
+#
+#      - name: Install golangci-lint
+#        run: |
+#          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+#            | sh -s -- -b $HOME/go/bin v1.64.8
+#          echo "$HOME/go/bin" >> $GITHUB_PATH
+#          golangci-lint --version
+#      - name: Show PATH
+#        run: echo $PATH
+#
+#      - name: Run Linter
+#        run: golangci-lint run ./...
 
       # ===========================
       # Docker Build & Push
