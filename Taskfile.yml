@@ -1,12 +1,32 @@
 version: "3"
+
 tasks:
-  lint:
+  build:
+    desc: "Build the bot binary"
     cmds:
-      - golangci-lint run --timeout=3m
+      - go build -o bin/tg-hamster ./cmd/tg-hamster
+
   test:
+    desc: "Run unit tests"
     cmds:
-      - go test -v -cover ./...
-  ci:
+      - go test ./... -v
+
+  lint:
+    desc: "Run golangci-lint"
     cmds:
-      - task lint
-      - task test
+      - golangci-lint run ./...
+
+  docker-build:
+    desc: "Build Docker image"
+    cmds:
+      - docker build -t teleta/tg-hamster:latest .
+
+  docker-up:
+    desc: "Start docker-compose"
+    cmds:
+      - docker-compose up -d
+
+  docker-down:
+    desc: "Stop docker-compose"
+    cmds:
+      - docker-compose down

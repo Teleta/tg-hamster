@@ -1,6 +1,6 @@
 project_name: tg-hamster
 builds:
-  - main: ./main.go
+  - main: ./cmd/tg-hamster
     binary: tg-hamster
 docker:
   image_templates:

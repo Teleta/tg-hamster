@@ -1,25 +1,32 @@
 name: CI
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v3
+
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: 1.25
+          go-version: 1.25.3
+
       - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
-      - name: Lint
-        run: golangci-lint run
-      - name: Test
-        run: go test -v -cover ./...
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $GOPATH/bin v1.53.3
+
+      - name: Build
+        run: make build || go build -o bin/tg-hamster ./cmd/tg-hamster
+
+      - name: Run tests
+        run: go test ./... -v
+
+      - name: Run linter
+        run: golangci-lint run ./...

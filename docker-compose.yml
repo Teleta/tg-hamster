@@ -1,7 +1,12 @@
-version: "3.8"
+version: "3.9"
+
 services:
   tg-hamster:
     build: .
+    container_name: tg-hamster
     environment:
-      - BOT_TOKEN=${BOT_TOKEN}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TIMEOUT_FILE=/app/timeouts.json
+    volumes:
+      - ./timeouts.json:/app/timeouts.json
     restart: unless-stopped
