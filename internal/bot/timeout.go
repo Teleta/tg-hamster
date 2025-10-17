@@ -2,8 +2,8 @@ package bot
 
 import (
 	"encoding/json"
-	"io/ioutil"
 	"log"
+	"os"
 	"sync"
 )
 
@@ -25,7 +25,7 @@ func (t *Timeouts) Load(file string, logger *log.Logger) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	content, err := ioutil.ReadFile(file)
+	content, err := os.ReadFile(file)
 	if err != nil {
 		logger.Printf("⚠️ Не удалось прочитать %s: %v", file, err)
 		return
@@ -51,7 +51,7 @@ func (t *Timeouts) Save(file string, logger *log.Logger) {
 		logger.Printf("⚠️ Ошибка сериализации таймаутов: %v", err)
 		return
 	}
-	if err := ioutil.WriteFile(file, content, 0644); err != nil {
+	if err := os.WriteFile(file, content, 0644); err != nil {
 		logger.Printf("⚠️ Ошибка записи в %s: %v", file, err)
 	}
 }
