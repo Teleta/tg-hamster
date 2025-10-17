@@ -4,7 +4,7 @@ on:
   push:
     branches: [ main ]
     tags:
-      - 'v*.*.*' # релизы по тегам вида v1.0.0
+      - 'v*.*.*'
   pull_request:
     branches: [ main ]
 
@@ -19,7 +19,7 @@ jobs:
         uses: actions/checkout@v3
 
       # ===========================
-      # Сборка и тесты (Go 1.25.3)
+      # Сборка и тесты (Go 1.25)
       # ===========================
       - name: Set up Go 1.25
         uses: actions/setup-go@v4
@@ -27,7 +27,9 @@ jobs:
           go-version: 1.25.3
 
       - name: Build binary
-        run: go build -v -o bin/tg-hamster ./cmd/tg-hamster
+        run: |
+          mkdir -p bin
+          go build -v -o bin/tg-hamster ./cmd/tg-hamster
 
       - name: Run Tests
         run: go test ./... -v
@@ -35,7 +37,7 @@ jobs:
       # ===========================
       # Линтинг (Go 1.25.1)
       # ===========================
-      - name: Set up Go 1.24 for linter
+      - name: Set up Go 1.25.1 for linter
         uses: actions/setup-go@v4
         with:
           go-version: 1.25.1
@@ -43,9 +45,11 @@ jobs:
       - name: Install golangci-lint
         run: |
           curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
-            | sh -s -- -b $GOBIN v1.64.8
-          echo "$GOBIN" >> $GITHUB_PATH
+            | sh -s -- -b $HOME/go/bin v1.64.8
+          echo "$HOME/go/bin" >> $GITHUB_PATH
           golangci-lint --version
+      - name: Show PATH
+        run: echo $PATH
 
       - name: Run Linter
         run: golangci-lint run ./...
