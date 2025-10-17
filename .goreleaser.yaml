@@ -1,0 +1,33 @@
+project_name: tg-hamster
+
+builds:
+  - id: tg-hamster
+    main: ./main.go
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    env:
+      - CGO_ENABLED=0
+
+archives:
+  - format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+dockers:
+  - image_templates:
+      - "docker.io/{{ .Env.DOCKER_USERNAME }}/tg-hamster:{{ .Version }}"
+    use: true
+    dockerfile: Dockerfile
+    goos: linux
+    goarch: amd64
+
+changelog:
+  use: git
+
+before:
+  hooks:
+    - go test ./...
