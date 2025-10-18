@@ -43,10 +43,22 @@ func main() {
 
 	b := bot.NewBot(token, timeoutFile, logger)
 
-	// Запускаем бота в отдельной горутине
+	// Запускаем периодическую очистку устаревших сообщений
 	go func() {
-		b.Start()
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				b.CleanupOldMessages()
+			}
+		}
 	}()
+
+	// Запускаем бота с безопасным восстановлением при панике
+	go b.StartWithContext(ctx)
 
 	// Блокируемся до завершения
 	<-ctx.Done()

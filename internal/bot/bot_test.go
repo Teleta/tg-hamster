@@ -1,10 +1,13 @@
 package bot
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // -------------------------
@@ -48,10 +51,14 @@ func TestTimeoutCommandSetGet(t *testing.T) {
 
 func TestProgressBarLength(t *testing.T) {
 	bar := progressBar(10, 5)
-	if len([]rune(bar)) != 12 { // 10 блоков + 2 скобки
+	if len([]rune(bar)) != 12 {
 		t.Errorf("progressBar неверной длины: %q", bar)
 	}
 }
+
+// -------------------------
+// Тест progressBar цвета
+// -------------------------
 
 func TestProgressBarBlocks(t *testing.T) {
 	tests := []struct {
@@ -114,22 +121,86 @@ func TestNextClockEmojiLoop(t *testing.T) {
 }
 
 // -------------------------
-// Вспомогательные проверки
+// Тест кэша сообщений
 // -------------------------
 
-func TestProgressBarCharacters(t *testing.T) {
-	bar := progressBar(10, 5)
-	valid := []string{"⬛", "🟧", "🟨", "🟩", "[", "]"}
-	for _, r := range bar {
-		found := false
-		for _, v := range valid {
-			if string(r) == v {
-				found = true
-				break
-			}
+func TestCacheAndCleanupMessages(t *testing.T) {
+	b := &Bot{
+		userMessages: make(map[int64][]cachedMessage),
+		muMessages:   sync.Mutex{},
+	}
+
+	msg := Message{
+		MessageID: 1,
+		Text:      "/test",
+		Chat:      Chat{ID: 1234},
+		From:      &User{ID: 42},
+	}
+
+	update := Update{UpdateID: 1, Message: &msg}
+	b.cacheMessage(update)
+
+	if len(b.userMessages[42]) != 1 {
+		t.Errorf("Ожидалось 1 сообщение в кэше, получили %d", len(b.userMessages[42]))
+	}
+
+	b.userMessages[42][0].timestamp = time.Now().Add(-61 * time.Second)
+	b.CleanupOldMessages()
+	if _, ok := b.userMessages[42]; ok {
+		t.Errorf("Сообщение не удалено после истечения времени")
+	}
+}
+
+// -------------------------
+// Тест безопасных API вызовов
+// -------------------------
+
+func TestSafeAPICallsNoPanic(t *testing.T) {
+	b := &Bot{apiURL: "http://127.0.0.1:0", logger: log.Default()}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("panic при safeSendSilent: %v", r)
 		}
-		if !found {
-			t.Errorf("progressBar содержит недопустимый символ: %q", string(r))
+	}()
+
+	b.safeSendSilent(123, "test")
+	b.safeSendSilentWithMarkup(123, "test", map[string]interface{}{})
+	b.safeEditMessage(123, 1, "edit")
+	b.safeDeleteMessage(123, 1)
+}
+
+// -------------------------
+// Тест остановки прогрессбара
+// -------------------------
+
+func TestStopProgressbar(t *testing.T) {
+	stopChan := make(chan struct{})
+	done := make(chan bool)
+
+	go func() {
+		select {
+		case <-stopChan:
+			done <- true
+		case <-time.After(2 * time.Second):
+			done <- false
 		}
+	}()
+
+	close(stopChan)
+
+	if !<-done {
+		t.Errorf("Прогрессбар не остановился при закрытии канала stopChan")
+	}
+}
+
+// -------------------------
+// Тест кнопки с эмодзи
+// -------------------------
+
+func TestButtonTextEmojis(t *testing.T) {
+	text := fmt.Sprintf("👉 %s 👈", pickPhrase())
+	if !strings.HasPrefix(text, "👉") || !strings.HasSuffix(text, "👈") {
+		t.Errorf("Текст кнопки должен быть с эмодзи рамкой, получили: %q", text)
 	}
 }

@@ -2,6 +2,7 @@ package bot
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,7 +26,9 @@ type Bot struct {
 	apiURL      string
 
 	userMessages map[int64][]cachedMessage
+	stopChans    map[int64]chan struct{} // каналы для остановки таймеров
 	muMessages   sync.Mutex
+	muStop       sync.Mutex
 }
 
 type cachedMessage struct {
@@ -68,7 +71,7 @@ type Callback struct {
 }
 
 // ==========================
-// Конструктор и запуск
+// Конструктор
 // ==========================
 
 func NewBot(token string, timeoutFile string, logger *log.Logger) *Bot {
@@ -79,17 +82,37 @@ func NewBot(token string, timeoutFile string, logger *log.Logger) *Bot {
 		logger:       logger,
 		apiURL:       fmt.Sprintf("https://api.telegram.org/bot%s", token),
 		userMessages: make(map[int64][]cachedMessage),
+		stopChans:    make(map[int64]chan struct{}),
 	}
 	b.timeouts.Load(timeoutFile, logger)
 	return b
 }
 
-func (b *Bot) Start() {
+// ==========================
+// Запуск бота
+// ==========================
+
+func (b *Bot) StartWithContext(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			b.logger.Printf("🔥 Паника в боте: %v, перезапуск через 3 секунды", r)
+			time.Sleep(3 * time.Second)
+			go b.StartWithContext(ctx)
+		}
+	}()
+
 	b.logger.Println("🤖 Бот запущен (polling)...")
 
 	offset := int64(0)
 	for {
-		updates, err := b.getUpdates(offset)
+		select {
+		case <-ctx.Done():
+			b.logger.Println("🛑 Остановка polling по контексту")
+			return
+		default:
+		}
+
+		updates, err := b.safeGetUpdates(offset)
 		if err != nil {
 			b.logger.Printf("Ошибка обновлений: %v", err)
 			time.Sleep(3 * time.Second)
@@ -142,11 +165,32 @@ func (b *Bot) deleteUserMessages(chatID, userID int64) {
 
 	for _, m := range msgs {
 		if m.msg.Chat.ID == chatID {
-			b.deleteMessage(chatID, m.msg.MessageID)
+			b.safeDeleteMessage(chatID, m.msg.MessageID)
 		}
 	}
-	// Очищаем кэш после удаления
 	b.userMessages[userID] = nil
+}
+
+func (b *Bot) CleanupOldMessages() {
+	b.muMessages.Lock()
+	defer b.muMessages.Unlock()
+
+	cutoff := time.Now().Add(-60 * time.Second)
+	for userID, msgs := range b.userMessages {
+		filtered := msgs[:0]
+		for _, m := range msgs {
+			if m.timestamp.After(cutoff) {
+				filtered = append(filtered, m)
+			} else {
+				b.safeDeleteMessage(m.msg.Chat.ID, m.msg.MessageID)
+			}
+		}
+		if len(filtered) == 0 {
+			delete(b.userMessages, userID)
+		} else {
+			b.userMessages[userID] = filtered
+		}
+	}
 }
 
 // ==========================
@@ -158,6 +202,7 @@ func (b *Bot) handleUpdate(u Update) {
 		msg := u.Message
 		if msg.Text != "" && strings.HasPrefix(msg.Text, "/timeout") {
 			b.handleTimeoutCommand(msg)
+			b.safeDeleteMessage(msg.Chat.ID, msg.MessageID)
 			return
 		}
 		if len(msg.NewChatMembers) > 0 {
@@ -181,29 +226,29 @@ func (b *Bot) handleTimeoutCommand(msg *Message) {
 	}
 
 	if !b.isAdmin(msg.Chat.ID, msg.From.ID) {
-		b.sendSilent(msg.Chat.ID, "❌ Только администратор может задавать таймаут")
+		b.safeSendSilent(msg.Chat.ID, "❌ Только администратор может задавать таймаут")
 		return
 	}
 
 	parts := strings.Fields(msg.Text)
 	if len(parts) < 2 {
-		b.sendSilent(msg.Chat.ID, "⚙️ Использование: /timeout <секунд>")
+		b.safeSendSilent(msg.Chat.ID, "⚙️ Использование: /timeout <секунд>")
 		return
 	}
 
 	timeoutSec, err := strconv.Atoi(parts[1])
 	if err != nil || timeoutSec < 5 || timeoutSec > 600 {
-		b.sendSilent(msg.Chat.ID, "⚙️ Укажите значение от 5 до 600 секунд")
+		b.safeSendSilent(msg.Chat.ID, "⚙️ Укажите значение от 5 до 600 секунд")
 		return
 	}
 
 	b.timeouts.Set(msg.Chat.ID, timeoutSec)
 	b.timeouts.Save(b.timeoutFile, b.logger)
-	msgID := b.sendSilent(msg.Chat.ID, fmt.Sprintf("✅ Таймаут установлен: %d сек.", timeoutSec))
+	msgID := b.safeSendSilent(msg.Chat.ID, fmt.Sprintf("✅ Таймаут установлен: %d сек.", timeoutSec))
 
 	// Автоудаление через 5 секунд
 	time.AfterFunc(5*time.Second, func() {
-		b.deleteMessage(msg.Chat.ID, msgID)
+		b.safeDeleteMessage(msg.Chat.ID, msgID)
 	})
 }
 
@@ -227,25 +272,106 @@ func (b *Bot) handleJoinMessage(msg *Message) {
 
 		timeout := b.timeouts.Get(msg.Chat.ID)
 
+		// Генерация случайного токена
+		token := randString(8)
+
 		button := map[string]interface{}{
-			"text":          pickPhrase(),
-			"callback_data": fmt.Sprintf("click:%d", user.ID),
+			"text":          pickPhrase() + " 👉",
+			"callback_data": fmt.Sprintf("click:%d:%s", user.ID, token),
 		}
 		replyMarkup := map[string]interface{}{
 			"inline_keyboard": [][]interface{}{{button}},
 		}
 
-		greetMsgID := b.sendSilentWithMarkup(msg.Chat.ID,
-			fmt.Sprintf("Приветствую, %s!\nНажми кнопку, чтобы подтвердить вход", username),
+		greetMsgID := b.safeSendSilentWithMarkup(msg.Chat.ID,
+			fmt.Sprintf("Привет, %s!\nНажмите кнопку, чтобы подтвердить вход", username),
 			replyMarkup,
 		)
 
-		// Удаляем системное сообщение о присоединении сразу
-		b.deleteMessage(msg.Chat.ID, msg.MessageID)
+		b.safeDeleteMessage(msg.Chat.ID, msg.MessageID)
 
-		// Таймер для пользователя
-		go b.startProgressbar(msg.Chat.ID, greetMsgID, timeout, msg.MessageID, user.ID)
+		// Запуск прогрессбара с токеном
+		go b.startProgressbar(msg.Chat.ID, greetMsgID, timeout, user.ID, token)
 	}
+}
+
+// ==========================
+// Прогрессбар и таймер с остановкой
+// ==========================
+
+type progressData struct {
+	stopChan   chan struct{}
+	token      string
+	userID     int64
+	greetMsgID int64 // ID сообщения с кнопкой
+}
+
+var progressStore = struct {
+	mu   sync.Mutex
+	data map[int64]progressData // key = greetMsgID
+}{
+	data: make(map[int64]progressData),
+}
+
+func (b *Bot) startProgressbar(chatID int64, greetMsgID int64, timeout int, userID int64, token string) {
+	msgProgressID := b.safeSendSilent(chatID, "⏳")
+
+	stop := make(chan struct{})
+	progressStore.mu.Lock()
+	progressStore.data[greetMsgID] = progressData{
+		stopChan:   stop,
+		token:      token,
+		userID:     userID,
+		greetMsgID: greetMsgID,
+	}
+	progressStore.mu.Unlock()
+
+	// Удаляем все сообщения нового участника
+	b.deleteUserMessages(chatID, userID)
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	remaining := timeout
+	step := 0
+
+	for remaining > 0 {
+		select {
+		case <-stop:
+			// Таймер остановлен при успешном нажатии
+			b.safeDeleteMessage(chatID, msgProgressID)
+			return
+		case <-ticker.C:
+			bar := progressBar(timeout, remaining)
+			b.safeEditMessage(chatID, msgProgressID, fmt.Sprintf("⏳ Осталось: %s %s", bar, nextClockEmoji(step)))
+			step++
+			remaining--
+		}
+	}
+
+	// Время вышло — баним пользователя
+	close(stop)
+	b.safeEditMessage(chatID, msgProgressID, "🚫 Время вышло! Пользователь заблокирован навсегда.")
+
+	banData := map[string]interface{}{
+		"user_id": userID,
+		"chat_id": chatID,
+	}
+	body, _ := json.Marshal(banData)
+	http.Post(fmt.Sprintf("%s/banChatMember", b.apiURL), "application/json", bytes.NewBuffer(body))
+
+	// Удаляем все сообщения нового участника
+	b.deleteUserMessages(chatID, userID)
+
+	// Удаляем кнопку и прогрессбар через 5 секунд
+	time.AfterFunc(5*time.Second, func() {
+		b.safeDeleteMessage(chatID, greetMsgID)
+		b.safeDeleteMessage(chatID, msgProgressID)
+	})
+
+	progressStore.mu.Lock()
+	delete(progressStore.data, greetMsgID)
+	progressStore.mu.Unlock()
 }
 
 // ==========================
@@ -256,84 +382,103 @@ func (b *Bot) handleCallback(cb *Callback) {
 	if cb.Message == nil || cb.From == nil {
 		return
 	}
-	b.deleteMessage(cb.Message.Chat.ID, cb.Message.MessageID)
-	b.sendSilent(cb.Message.Chat.ID, fmt.Sprintf("✨ %s, добро пожаловать!", cb.From.FirstName))
+
+	parts := strings.Split(cb.Data, ":")
+	if len(parts) != 3 || parts[0] != "click" {
+		return
+	}
+	userID, _ := strconv.ParseInt(parts[1], 10, 64)
+	token := parts[2]
+
+	progressStore.mu.Lock()
+	p, ok := progressStore.data[cb.Message.MessageID]
+	progressStore.mu.Unlock()
+	if !ok {
+		return
+	}
+
+	// Проверка: нажатие кнопки владельцем и правильный токен
+	if cb.From.ID != userID || p.token != token {
+		return
+	}
+
+	// Таймер останавливаем
+	close(p.stopChan)
+
+	// Удаляем сообщение с кнопкой
+	b.safeDeleteMessage(cb.Message.Chat.ID, p.greetMsgID)
+
+	// Отправляем приветствие
+	b.safeSendSilent(cb.Message.Chat.ID, fmt.Sprintf("✨ %s, добро пожаловать!", cb.From.FirstName))
+
+	// Удаляем прогрессбар из хранилища
+	progressStore.mu.Lock()
+	delete(progressStore.data, p.greetMsgID)
+	progressStore.mu.Unlock()
+}
+
+func (b *Bot) stopProgressbar(chatID int64, msgID int64) {
+	progressStore.mu.Lock()
+	defer progressStore.mu.Unlock()
+
+	if p, ok := progressStore.data[msgID]; ok {
+		close(p.stopChan)
+		delete(progressStore.data, msgID)
+	}
+}
+
+func (b *Bot) validateToken(msgID int64, token string) bool {
+	progressStore.mu.Lock()
+	defer progressStore.mu.Unlock()
+
+	if p, ok := progressStore.data[msgID]; ok {
+		return p.token == token
+	}
+	return false
 }
 
 // ==========================
-// Прогрессбар и таймер
+// Генерация случайного токена
 // ==========================
 
-func (b *Bot) startProgressbar(chatID int64, btnMsgID int64, timeout int, joinMsgID int64, userID int64) {
-	// Удаляем системное сообщение о присоединении
-	b.deleteMessage(chatID, joinMsgID)
+func randString(n int) string {
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	res := make([]byte, n)
+	for i := range res {
+		res[i] = letters[time.Now().UnixNano()%int64(len(letters))]
+		time.Sleep(time.Nanosecond)
+	}
+	return string(res)
+}
 
-	// Создаём сообщение прогрессбара
-	msgID := b.sendSilent(chatID, "✨")
+// ==========================
+// Работа с каналами stop
+// ==========================
 
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
+func (b *Bot) setStopChannel(userID int64, ch chan struct{}) {
+	b.muStop.Lock()
+	defer b.muStop.Unlock()
+	b.stopChans[userID] = ch
+}
 
-	total := timeout
-	remaining := total
-	step := 0
+func (b *Bot) getStopChannel(userID int64) chan struct{} {
+	b.muStop.Lock()
+	defer b.muStop.Unlock()
+	ch := b.stopChans[userID]
+	delete(b.stopChans, userID)
+	return ch
+}
 
-	stopChan := make(chan struct{})
+// ==========================
+// Безопасные вызовы Telegram API
+// ==========================
 
-	// Горyтина для удаления сообщений пользователя каждые 3 секунды
-	go func() {
-		for {
-			select {
-			case <-stopChan:
-				return
-			case <-ticker.C:
-				b.deleteUserMessages(chatID, userID)
-			}
+func (b *Bot) safeGetUpdates(offset int64) ([]Update, error) {
+	defer func() {
+		if r := recover(); r != nil {
+			b.logger.Printf("🔥 Паника в getUpdates: %v", r)
 		}
 	}()
-
-	for remaining > 0 {
-		bar := progressBar(total, remaining)
-		b.editMessage(chatID, msgID, fmt.Sprintf("⏳ Осталось: %s %s", bar, nextClockEmoji(step)))
-		step++
-		<-ticker.C
-		remaining -= 3
-	}
-
-	// Останавливаем горутину удаления сообщений
-	close(stopChan)
-
-	// Повторяем попытки бана, пока не успешен
-	for {
-		banData := map[string]interface{}{
-			"user_id": userID,
-			"chat_id": chatID,
-		}
-		body, _ := json.Marshal(banData)
-		resp, err := http.Post(fmt.Sprintf("%s/banChatMember", b.apiURL), "application/json", bytes.NewBuffer(body))
-		if err == nil && resp != nil {
-			resp.Body.Close()
-			break
-		}
-		b.logger.Printf("Ошибка бана пользователя %d: %v, повтор через 3 секунды", userID, err)
-		time.Sleep(3 * time.Second)
-	}
-
-	// Обновляем сообщение прогрессбара с уведомлением о бане
-	b.editMessage(chatID, msgID, "🚫 Время вышло! Пользователь заблокирован навсегда.")
-	time.AfterFunc(5*time.Second, func() {
-		b.deleteMessage(chatID, msgID)
-	})
-
-	// Удаляем кнопку
-	b.deleteMessage(chatID, btnMsgID)
-}
-
-// ==========================
-// Telegram API helpers
-// ==========================
-
-func (b *Bot) getUpdates(offset int64) ([]Update, error) {
 	resp, err := http.Get(fmt.Sprintf("%s/getUpdates?offset=%d&timeout=30", b.apiURL, offset))
 	if err != nil {
 		return nil, err
@@ -346,7 +491,8 @@ func (b *Bot) getUpdates(offset int64) ([]Update, error) {
 	return data.Result, err
 }
 
-func (b *Bot) sendSilent(chatID int64, text string) int64 {
+func (b *Bot) safeSendSilent(chatID int64, text string) int64 {
+	defer func() { recover() }()
 	data := map[string]interface{}{
 		"chat_id":              chatID,
 		"text":                 text,
@@ -354,11 +500,15 @@ func (b *Bot) sendSilent(chatID int64, text string) int64 {
 	}
 	body, _ := json.Marshal(data)
 	resp, _ := http.Post(fmt.Sprintf("%s/sendMessage", b.apiURL), "application/json", bytes.NewBuffer(body))
-	defer resp.Body.Close()
-	return extractMessageID(resp.Body)
+	if resp != nil {
+		defer resp.Body.Close()
+		return extractMessageID(resp.Body)
+	}
+	return 0
 }
 
-func (b *Bot) sendSilentWithMarkup(chatID int64, text string, markup interface{}) int64 {
+func (b *Bot) safeSendSilentWithMarkup(chatID int64, text string, markup interface{}) int64 {
+	defer func() { recover() }()
 	data := map[string]interface{}{
 		"chat_id":              chatID,
 		"text":                 text,
@@ -367,19 +517,15 @@ func (b *Bot) sendSilentWithMarkup(chatID int64, text string, markup interface{}
 	}
 	body, _ := json.Marshal(data)
 	resp, _ := http.Post(fmt.Sprintf("%s/sendMessage", b.apiURL), "application/json", bytes.NewBuffer(body))
-	defer resp.Body.Close()
-	return extractMessageID(resp.Body)
-}
-
-func extractMessageID(r io.Reader) int64 {
-	var res struct {
-		Result Message `json:"result"`
+	if resp != nil {
+		defer resp.Body.Close()
+		return extractMessageID(resp.Body)
 	}
-	json.NewDecoder(r).Decode(&res)
-	return res.Result.MessageID
+	return 0
 }
 
-func (b *Bot) editMessage(chatID int64, msgID int64, text string) {
+func (b *Bot) safeEditMessage(chatID int64, msgID int64, text string) {
+	defer func() { recover() }()
 	data := map[string]interface{}{
 		"chat_id":    chatID,
 		"message_id": msgID,
@@ -389,7 +535,8 @@ func (b *Bot) editMessage(chatID int64, msgID int64, text string) {
 	http.Post(fmt.Sprintf("%s/editMessageText", b.apiURL), "application/json", bytes.NewBuffer(body))
 }
 
-func (b *Bot) deleteMessage(chatID int64, msgID int64) {
+func (b *Bot) safeDeleteMessage(chatID int64, msgID int64) {
+	defer func() { recover() }()
 	data := map[string]interface{}{
 		"chat_id":    chatID,
 		"message_id": msgID,
@@ -398,7 +545,12 @@ func (b *Bot) deleteMessage(chatID int64, msgID int64) {
 	http.Post(fmt.Sprintf("%s/deleteMessage", b.apiURL), "application/json", bytes.NewBuffer(body))
 }
 
+// ==========================
+// Администраторы
+// ==========================
+
 func (b *Bot) isAdmin(chatID, userID int64) bool {
+	defer func() { recover() }()
 	resp, err := http.Get(fmt.Sprintf("%s/getChatAdministrators?chat_id=%d", b.apiURL, chatID))
 	if err != nil {
 		b.logger.Printf("Ошибка получения администраторов: %v", err)
@@ -430,7 +582,6 @@ func progressBar(total int, remaining int) string {
 	percent := float64(remaining) / float64(total)
 	bar := make([]string, n)
 
-	// Определяем количество черных, оранжевых и желтых
 	var black, orange, yellow int
 
 	switch {
@@ -458,19 +609,15 @@ func progressBar(total int, remaining int) string {
 		black = 10
 	}
 
-	// Заполняем черные слева направо
 	for i := 0; i < black && i < n; i++ {
 		bar[i] = "⬛"
 	}
-	// Оранжевые после черных
 	for i := black; i < black+orange && i < n; i++ {
 		bar[i] = "🟧"
 	}
-	// Желтые после оранжевых
 	for i := black + orange; i < black+orange+yellow && i < n; i++ {
 		bar[i] = "🟨"
 	}
-	// Остальные зеленые
 	for i := 0; i < n; i++ {
 		if bar[i] == "" {
 			bar[i] = "🟩"
@@ -486,4 +633,12 @@ func nextClockEmoji(i int) string {
 		"🕗", "🕣", "🕘", "🕤", "🕙", "🕥", "🕚", "🕦",
 	}
 	return clocks[i%len(clocks)]
+}
+
+func extractMessageID(r io.Reader) int64 {
+	var res struct {
+		Result Message `json:"result"`
+	}
+	json.NewDecoder(r).Decode(&res)
+	return res.Result.MessageID
 }
