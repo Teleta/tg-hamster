@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -22,6 +23,14 @@ type Bot struct {
 	timeouts    *Timeouts
 	logger      *log.Logger
 	apiURL      string
+
+	userMessages map[int64][]cachedMessage
+	muMessages   sync.Mutex
+}
+
+type cachedMessage struct {
+	msg       Message
+	timestamp time.Time
 }
 
 type Update struct {
@@ -64,11 +73,12 @@ type Callback struct {
 
 func NewBot(token string, timeoutFile string, logger *log.Logger) *Bot {
 	b := &Bot{
-		apiToken:    token,
-		timeoutFile: timeoutFile,
-		timeouts:    NewTimeouts(),
-		logger:      logger,
-		apiURL:      fmt.Sprintf("https://api.telegram.org/bot%s", token),
+		apiToken:     token,
+		timeoutFile:  timeoutFile,
+		timeouts:     NewTimeouts(),
+		logger:       logger,
+		apiURL:       fmt.Sprintf("https://api.telegram.org/bot%s", token),
+		userMessages: make(map[int64][]cachedMessage),
 	}
 	b.timeouts.Load(timeoutFile, logger)
 	return b
@@ -88,9 +98,55 @@ func (b *Bot) Start() {
 
 		for _, u := range updates {
 			offset = u.UpdateID + 1
+			b.cacheMessage(u)
 			go b.handleUpdate(u)
 		}
 	}
+}
+
+// ==========================
+// Кэш сообщений пользователей
+// ==========================
+
+func (b *Bot) cacheMessage(u Update) {
+	if u.Message != nil && u.Message.From != nil {
+		b.muMessages.Lock()
+		defer b.muMessages.Unlock()
+
+		userID := u.Message.From.ID
+		b.userMessages[userID] = append(b.userMessages[userID], cachedMessage{
+			msg:       *u.Message,
+			timestamp: time.Now(),
+		})
+
+		// Очистка сообщений старше 60 секунд
+		cutoff := time.Now().Add(-60 * time.Second)
+		filtered := b.userMessages[userID][:0]
+		for _, m := range b.userMessages[userID] {
+			if m.timestamp.After(cutoff) {
+				filtered = append(filtered, m)
+			}
+		}
+		b.userMessages[userID] = filtered
+	}
+}
+
+func (b *Bot) deleteUserMessages(chatID, userID int64) {
+	b.muMessages.Lock()
+	defer b.muMessages.Unlock()
+
+	msgs, ok := b.userMessages[userID]
+	if !ok {
+		return
+	}
+
+	for _, m := range msgs {
+		if m.msg.Chat.ID == chatID {
+			b.deleteMessage(chatID, m.msg.MessageID)
+		}
+	}
+	// Очищаем кэш после удаления
+	b.userMessages[userID] = nil
 }
 
 // ==========================
@@ -143,7 +199,12 @@ func (b *Bot) handleTimeoutCommand(msg *Message) {
 
 	b.timeouts.Set(msg.Chat.ID, timeoutSec)
 	b.timeouts.Save(b.timeoutFile, b.logger)
-	b.sendSilent(msg.Chat.ID, fmt.Sprintf("✅ Таймаут установлен: %d сек.", timeoutSec))
+	msgID := b.sendSilent(msg.Chat.ID, fmt.Sprintf("✅ Таймаут установлен: %d сек.", timeoutSec))
+
+	// Автоудаление через 5 секунд
+	time.AfterFunc(5*time.Second, func() {
+		b.deleteMessage(msg.Chat.ID, msgID)
+	})
 }
 
 // ==========================
@@ -175,11 +236,11 @@ func (b *Bot) handleJoinMessage(msg *Message) {
 		}
 
 		greetMsgID := b.sendSilentWithMarkup(msg.Chat.ID,
-			fmt.Sprintf("Приветствую, %s!\nНажми кнопку, чтобы подтвердить", username),
+			fmt.Sprintf("Приветствую, %s!\nНажми кнопку, чтобы подтвердить вход", username),
 			replyMarkup,
 		)
 
-		// Удаляем системное сообщение о присоединении
+		// Удаляем системное сообщение о присоединении сразу
 		b.deleteMessage(msg.Chat.ID, msg.MessageID)
 
 		// Таймер для пользователя
@@ -266,11 +327,6 @@ func (b *Bot) startProgressbar(chatID int64, btnMsgID int64, timeout int, joinMs
 
 	// Удаляем кнопку
 	b.deleteMessage(chatID, btnMsgID)
-}
-
-// Заглушка: удалить все сообщения пользователя
-func (b *Bot) deleteUserMessages(chatID, userID int64) {
-	// Можно реализовать хранение ID сообщений или getUpdates
 }
 
 // ==========================
@@ -379,40 +435,25 @@ func progressBar(total int, remaining int) string {
 
 	switch {
 	case percent > 0.9:
-		black = 0
-		orange = 0
-		yellow = 0
+		black, orange, yellow = 0, 0, 0
 	case percent > 0.8:
-		black = 1
-		yellow = 1
+		black, yellow = 1, 1
 	case percent > 0.7:
-		black = 2
-		yellow = 2
+		black, yellow = 2, 2
 	case percent > 0.6:
-		black = 3
-		orange = 1
-		yellow = 2
+		black, orange, yellow = 3, 1, 2
 	case percent > 0.5:
-		black = 4
-		orange = 2
-		yellow = 2
+		black, orange, yellow = 4, 2, 2
 	case percent > 0.4:
-		black = 5
-		orange = 2
-		yellow = 2
+		black, orange, yellow = 5, 2, 2
 	case percent > 0.3:
-		black = 6
-		orange = 3
-		yellow = 1
+		black, orange, yellow = 6, 3, 1
 	case percent > 0.2:
-		black = 7
-		orange = 3
+		black, orange = 7, 3
 	case percent > 0.1:
-		black = 8
-		orange = 2
+		black, orange = 8, 2
 	case percent > 0.0:
-		black = 9
-		orange = 1
+		black, orange = 9, 1
 	default:
 		black = 10
 	}
