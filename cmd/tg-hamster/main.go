@@ -13,7 +13,6 @@ import (
 )
 
 func main() {
-	// Загружаем переменные окружения
 	_ = godotenv.Load()
 
 	token := os.Getenv("TELEGRAM_BOT_TOKEN")
@@ -26,24 +25,23 @@ func main() {
 		timeoutFile = "timeouts.json"
 	}
 
-	logger := log.New(os.Stdout, "[tg-hamster] ", log.LstdFlags|log.Lshortfile)
+	logger := bot.NewLogger()
 
-	// Создаём контекст с graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Обрабатываем сигналы завершения
+	// Обработка сигналов
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 		<-sigCh
-		logger.Println("🛑 Завершение работы по сигналу...")
+		logger.Info("🛑 Завершение работы по сигналу...")
 		cancel()
 	}()
 
 	b := bot.NewBot(token, timeoutFile, logger)
 
-	// Запускаем периодическую очистку устаревших сообщений
+	// Очистка устаревших сообщений каждые 10 секунд
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
@@ -57,12 +55,10 @@ func main() {
 		}
 	}()
 
-	// Запускаем бота с безопасным восстановлением при панике
+	// Запуск polling
 	go b.StartWithContext(ctx)
 
-	// Блокируемся до завершения
 	<-ctx.Done()
-
-	logger.Println("✅ Бот корректно остановлен")
-	time.Sleep(time.Second) // даём завершить активные запросы
+	logger.Info("✅ Бот корректно остановлен")
+	time.Sleep(time.Second)
 }

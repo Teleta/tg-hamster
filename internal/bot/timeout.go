@@ -3,7 +3,6 @@ package bot
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"sync"
 )
@@ -28,18 +27,17 @@ func NewTimeouts() *Timeouts {
 }
 
 // Load загружает таймауты из JSON файла.
-// Возвращает ошибку при проблемах с чтением или парсингом.
-func (t *Timeouts) Load(file string, logger *log.Logger) error {
+func (t *Timeouts) Load(file string, logger *Logger) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	content, err := os.ReadFile(file)
 	if err != nil {
 		if os.IsNotExist(err) {
-			logger.Printf("ℹ️ Файл %s не найден, используем пустой список таймаутов", file)
+			logger.Info("Файл %s не найден, используем пустой список таймаутов", file)
 			return nil
 		}
-		logger.Printf("⚠️ Не удалось прочитать %s: %v", file, err)
+		logger.Warn("Не удалось прочитать %s: %v", file, err)
 		return err
 	}
 
@@ -48,26 +46,28 @@ func (t *Timeouts) Load(file string, logger *log.Logger) error {
 	}
 
 	if err := json.Unmarshal(content, &t.Data); err != nil {
-		logger.Printf("⚠️ Ошибка парсинга %s: %v", file, err)
+		logger.Warn("Ошибка парсинга %s: %v", file, err)
 		return err
 	}
+	logger.Info("Загружено %d таймаутов из %s", len(t.Data), file)
 	return nil
 }
 
 // Save сохраняет таймауты в JSON файл.
-func (t *Timeouts) Save(file string, logger *log.Logger) error {
+func (t *Timeouts) Save(file string, logger *Logger) error {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
 	content, err := json.MarshalIndent(t.Data, "", "  ")
 	if err != nil {
-		logger.Printf("⚠️ Ошибка сериализации таймаутов: %v", err)
+		logger.Warn("Ошибка сериализации таймаутов: %v", err)
 		return err
 	}
 	if err := os.WriteFile(file, content, 0644); err != nil {
-		logger.Printf("⚠️ Ошибка записи в %s: %v", file, err)
+		logger.Warn("Ошибка записи в %s: %v", file, err)
 		return err
 	}
+	logger.Info("Сохранено %d таймаутов в %s", len(t.Data), file)
 	return nil
 }
 

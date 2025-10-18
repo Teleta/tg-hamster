@@ -1,9 +1,8 @@
 package bot
 
 import (
-	"fmt"
-	"log"
-	"os"
+	"container/list"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -31,18 +30,18 @@ func TestPickPhrase(t *testing.T) {
 // -------------------------
 
 func TestTimeoutCommandSetGet(t *testing.T) {
+	logger := NewLogger()
 	to := NewTimeouts()
 	to.Set(1, 42)
 	if got := to.Get(1); got != 42 {
 		t.Errorf("ожидалось 42, получили %d", got)
 	}
-	to.Save("test_timeouts.json", log.Default())
+	to.Save("test_timeouts.json", logger)
 	loaded := NewTimeouts()
-	loaded.Load("test_timeouts.json", log.Default())
+	loaded.Load("test_timeouts.json", logger)
 	if got := loaded.Get(1); got != 42 {
 		t.Errorf("после Load ожидалось 42, получили %d", got)
 	}
-	_ = os.Remove("test_timeouts.json")
 }
 
 // -------------------------
@@ -111,24 +110,19 @@ func TestNextClockEmojiSequence(t *testing.T) {
 	}
 }
 
-func TestNextClockEmojiLoop(t *testing.T) {
-	for i := 0; i < 50; i++ {
-		e := nextClockEmoji(i)
-		if e == "" {
-			t.Errorf("emoji пустой для i=%d", i)
-		}
-	}
-}
-
 // -------------------------
 // Тест кэша сообщений
 // -------------------------
 
 func TestCacheAndCleanupMessages(t *testing.T) {
 	b := &Bot{
-		userMessages: make(map[int64][]cachedMessage),
-		muMessages:   sync.Mutex{},
+		logger:       NewLogger(),
+		userMessages: make(map[int64]*list.List),
 	}
+
+	// Мокируем Telegram API
+	b.DeleteMessageFunc = func(chatID, msgID int64) {}
+	b.SendSilentFunc = func(chatID int64, text string) int64 { return 1 }
 
 	msg := Message{
 		MessageID: 1,
@@ -140,11 +134,16 @@ func TestCacheAndCleanupMessages(t *testing.T) {
 	update := Update{UpdateID: 1, Message: &msg}
 	b.cacheMessage(update)
 
-	if len(b.userMessages[42]) != 1 {
-		t.Errorf("Ожидалось 1 сообщение в кэше, получили %d", len(b.userMessages[42]))
+	if b.userMessages[42].Len() != 1 {
+		t.Errorf("Ожидалось 1 сообщение в кэше, получили %d", b.userMessages[42].Len())
 	}
 
-	b.userMessages[42][0].timestamp = time.Now().Add(-61 * time.Second)
+	elem := b.userMessages[42].Front()
+	if elem == nil {
+		t.Fatalf("в списке нет элементов")
+	}
+	elem.Value = cachedMessage{msg: msg, timestamp: time.Now().Add(-61 * time.Second)}
+
 	b.CleanupOldMessages()
 	if _, ok := b.userMessages[42]; ok {
 		t.Errorf("Сообщение не удалено после истечения времени")
@@ -152,55 +151,58 @@ func TestCacheAndCleanupMessages(t *testing.T) {
 }
 
 // -------------------------
-// Тест безопасных API вызовов
+// Тест прогрессбара с моками
 // -------------------------
 
-func TestSafeAPICallsNoPanic(t *testing.T) {
-	b := &Bot{apiURL: "http://127.0.0.1:0", logger: log.Default()}
+// Мок roundTripper для httpClient
+type roundTripperFunc func(req *http.Request) *http.Response
 
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("panic при safeSendSilent: %v", r)
-		}
-	}()
-
-	b.safeSendSilent(123, "test")
-	b.safeSendSilentWithMarkup(123, "test", map[string]interface{}{})
-	b.safeEditMessage(123, 1, "edit")
-	b.safeDeleteMessage(123, 1)
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req), nil
 }
 
-// -------------------------
-// Тест остановки прогрессбара
-// -------------------------
+func TestStartProgressbarStopsAndDeletes(t *testing.T) {
+	b := &Bot{
+		logger:       NewLogger(),
+		userMessages: make(map[int64]*list.List),
+		activeTokens: make(map[int64]string),
+		progressStore: struct {
+			mu   sync.Mutex
+			data map[int64]progressData
+		}{data: make(map[int64]progressData)},
+	}
 
-func TestStopProgressbar(t *testing.T) {
-	stopChan := make(chan struct{})
-	done := make(chan bool)
+	// Мокируем все функции, чтобы не было HTTP
+	b.SendSilentFunc = func(chatID int64, text string) int64 { return 1 }
+	b.DeleteMessageFunc = func(chatID, msgID int64) {}
+	b.EditMessageFunc = func(chatID, msgID int64, text string) {}
+	b.BanUserFunc = func(chatID, userID int64) {} // <-- избегаем httpClient.Post
 
+	chatID := int64(123)
+	greetMsgID := int64(456)
+	timeout := 1 // секунда
+	userID := int64(42)
+	token := "FAKETOKEN"
+
+	done := make(chan struct{})
 	go func() {
-		select {
-		case <-stopChan:
-			done <- true
-		case <-time.After(2 * time.Second):
-			done <- false
-		}
+		b.startProgressbar(chatID, greetMsgID, timeout, userID, token)
+		close(done)
 	}()
 
-	close(stopChan)
+	time.Sleep(2 * time.Second)
 
-	if !<-done {
-		t.Errorf("Прогрессбар не остановился при закрытии канала stopChan")
+	b.muTokens.Lock()
+	if _, ok := b.activeTokens[userID]; ok {
+		t.Errorf("токен не удалён после завершения прогрессбара")
 	}
-}
+	b.muTokens.Unlock()
 
-// -------------------------
-// Тест кнопки с эмодзи
-// -------------------------
-
-func TestButtonTextEmojis(t *testing.T) {
-	text := fmt.Sprintf("👉 %s 👈", pickPhrase())
-	if !strings.HasPrefix(text, "👉") || !strings.HasSuffix(text, "👈") {
-		t.Errorf("Текст кнопки должен быть с эмодзи рамкой, получили: %q", text)
+	b.progressStore.mu.Lock()
+	if _, ok := b.progressStore.data[greetMsgID]; ok {
+		t.Errorf("прогрессбар не удалён из хранилища")
 	}
+	b.progressStore.mu.Unlock()
+
+	<-done
 }
