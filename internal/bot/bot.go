@@ -447,7 +447,7 @@ func progressBar(total int, remaining int) string {
 	case percent > 0.4:
 		black, orange, yellow = 5, 2, 2
 	case percent > 0.3:
-		black, orange, yellow = 6, 3, 1
+		black, orange, yellow = 6, 2, 2
 	case percent > 0.2:
 		black, orange = 7, 3
 	case percent > 0.1:
