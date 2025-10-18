@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net/http"
 	"strconv"
 	"strings"
@@ -25,8 +24,6 @@ type Bot struct {
 	apiURL      string
 }
 
-// Telegram API types
-
 type Update struct {
 	UpdateID int64     `json:"update_id"`
 	Message  *Message  `json:"message,omitempty"`
@@ -34,10 +31,11 @@ type Update struct {
 }
 
 type Message struct {
-	MessageID int64  `json:"message_id"`
-	Text      string `json:"text"`
-	Chat      Chat   `json:"chat"`
-	From      *User  `json:"from,omitempty"`
+	MessageID      int64   `json:"message_id"`
+	Text           string  `json:"text"`
+	Chat           Chat    `json:"chat"`
+	From           *User   `json:"from,omitempty"`
+	NewChatMembers []*User `json:"new_chat_members,omitempty"`
 }
 
 type Chat struct {
@@ -48,6 +46,8 @@ type Chat struct {
 type User struct {
 	ID        int64  `json:"id"`
 	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name,omitempty"`
+	Username  string `json:"username,omitempty"`
 	IsBot     bool   `json:"is_bot"`
 }
 
@@ -104,7 +104,7 @@ func (b *Bot) handleUpdate(u Update) {
 			b.handleTimeoutCommand(msg)
 			return
 		}
-		if strings.Contains(msg.Text, "joined") || strings.Contains(strings.ToLower(msg.Text), "added") {
+		if len(msg.NewChatMembers) > 0 {
 			go b.handleJoinMessage(msg)
 			return
 		}
@@ -147,28 +147,44 @@ func (b *Bot) handleTimeoutCommand(msg *Message) {
 }
 
 // ==========================
-// Приветствие нового пользователя
+// Приветствие новых участников
 // ==========================
 
 func (b *Bot) handleJoinMessage(msg *Message) {
-	if msg.From == nil {
-		return
-	}
+	for _, user := range msg.NewChatMembers {
+		username := user.FirstName
+		if user.LastName != "" {
+			username += " " + user.LastName
+		}
+		if username == "" {
+			username = user.Username
+		}
+		username = strings.TrimSpace(username)
+		if username == "" {
+			username = "ID:" + strconv.FormatInt(user.ID, 10)
+		}
 
-	username := msg.From.FirstName
-	text := pickPhrase()
+		timeout := b.timeouts.Get(msg.Chat.ID)
 
-	timeout := b.timeouts.Get(msg.Chat.ID)
-	button := map[string]interface{}{
-		"text":          "Я — Грут 🌱",
-		"callback_data": fmt.Sprintf("click:%d", msg.From.ID),
-	}
-	replyMarkup := map[string]interface{}{
-		"inline_keyboard": [][]interface{}{{button}},
-	}
+		button := map[string]interface{}{
+			"text":          pickPhrase(),
+			"callback_data": fmt.Sprintf("click:%d", user.ID),
+		}
+		replyMarkup := map[string]interface{}{
+			"inline_keyboard": [][]interface{}{{button}},
+		}
 
-	greetMsgID := b.sendSilentWithMarkup(msg.Chat.ID, fmt.Sprintf("Приветствую, %s!\n%s", username, text), replyMarkup)
-	go b.startProgressbar(msg.Chat.ID, greetMsgID, timeout, msg.MessageID)
+		greetMsgID := b.sendSilentWithMarkup(msg.Chat.ID,
+			fmt.Sprintf("Приветствую, %s!\nНажми кнопку, чтобы подтвердить", username),
+			replyMarkup,
+		)
+
+		// Удаляем системное сообщение о присоединении
+		b.deleteMessage(msg.Chat.ID, msg.MessageID)
+
+		// Таймер для пользователя
+		go b.startProgressbar(msg.Chat.ID, greetMsgID, timeout, msg.MessageID, user.ID)
+	}
 }
 
 // ==========================
@@ -184,19 +200,77 @@ func (b *Bot) handleCallback(cb *Callback) {
 }
 
 // ==========================
-// Прогрессбар
+// Прогрессбар и таймер
 // ==========================
 
-func (b *Bot) startProgressbar(chatID int64, msgID int64, timeout int, joinMsgID int64) {
+func (b *Bot) startProgressbar(chatID int64, btnMsgID int64, timeout int, joinMsgID int64, userID int64) {
+	// Удаляем системное сообщение о присоединении
+	b.deleteMessage(chatID, joinMsgID)
+
+	// Создаём сообщение прогрессбара
+	msgID := b.sendSilent(chatID, "✨")
+
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
 	total := timeout
-	for remaining := total; remaining > 0; remaining -= 3 {
+	remaining := total
+	step := 0
+
+	stopChan := make(chan struct{})
+
+	// Горyтина для удаления сообщений пользователя каждые 3 секунды
+	go func() {
+		for {
+			select {
+			case <-stopChan:
+				return
+			case <-ticker.C:
+				b.deleteUserMessages(chatID, userID)
+			}
+		}
+	}()
+
+	for remaining > 0 {
 		bar := progressBar(total, remaining)
-		b.editMessage(chatID, msgID, fmt.Sprintf("⏳ Осталось: %s %s", bar, randomClockEmoji()))
+		b.editMessage(chatID, msgID, fmt.Sprintf("⏳ Осталось: %s %s", bar, nextClockEmoji(step)))
+		step++
+		<-ticker.C
+		remaining -= 3
+	}
+
+	// Останавливаем горутину удаления сообщений
+	close(stopChan)
+
+	// Повторяем попытки бана, пока не успешен
+	for {
+		banData := map[string]interface{}{
+			"user_id": userID,
+			"chat_id": chatID,
+		}
+		body, _ := json.Marshal(banData)
+		resp, err := http.Post(fmt.Sprintf("%s/banChatMember", b.apiURL), "application/json", bytes.NewBuffer(body))
+		if err == nil && resp != nil {
+			resp.Body.Close()
+			break
+		}
+		b.logger.Printf("Ошибка бана пользователя %d: %v, повтор через 3 секунды", userID, err)
 		time.Sleep(3 * time.Second)
 	}
-	b.sendSilent(chatID, "🚫 Время вышло! Пользователь забанен навсегда.")
-	b.deleteMessage(chatID, msgID)
-	b.deleteMessage(chatID, joinMsgID)
+
+	// Обновляем сообщение прогрессбара с уведомлением о бане
+	b.editMessage(chatID, msgID, "🚫 Время вышло! Пользователь заблокирован навсегда.")
+	time.AfterFunc(5*time.Second, func() {
+		b.deleteMessage(chatID, msgID)
+	})
+
+	// Удаляем кнопку
+	b.deleteMessage(chatID, btnMsgID)
+}
+
+// Заглушка: удалить все сообщения пользователя
+func (b *Bot) deleteUserMessages(chatID, userID int64) {
+	// Можно реализовать хранение ID сообщений или getUpdates
 }
 
 // ==========================
@@ -295,14 +369,80 @@ func (b *Bot) isAdmin(chatID, userID int64) bool {
 // Вспомогательные функции
 // ==========================
 
-func progressBar(total, remaining int) string {
-	done := total - remaining
-	blocks := int((float64(done) / float64(total)) * 10)
-	bar := strings.Repeat("█", blocks) + strings.Repeat("░", 10-blocks)
-	return fmt.Sprintf("[%s]", bar)
+func progressBar(total int, remaining int) string {
+	const n = 10
+	percent := float64(remaining) / float64(total)
+	bar := make([]string, n)
+
+	// Определяем количество черных, оранжевых и желтых
+	var black, orange, yellow int
+
+	switch {
+	case percent > 0.9:
+		black = 0
+		orange = 0
+		yellow = 0
+	case percent > 0.8:
+		black = 1
+		yellow = 1
+	case percent > 0.7:
+		black = 2
+		yellow = 2
+	case percent > 0.6:
+		black = 3
+		orange = 1
+		yellow = 2
+	case percent > 0.5:
+		black = 4
+		orange = 2
+		yellow = 2
+	case percent > 0.4:
+		black = 5
+		orange = 2
+		yellow = 2
+	case percent > 0.3:
+		black = 6
+		orange = 3
+		yellow = 1
+	case percent > 0.2:
+		black = 7
+		orange = 3
+	case percent > 0.1:
+		black = 8
+		orange = 2
+	case percent > 0.0:
+		black = 9
+		orange = 1
+	default:
+		black = 10
+	}
+
+	// Заполняем черные слева направо
+	for i := 0; i < black && i < n; i++ {
+		bar[i] = "⬛"
+	}
+	// Оранжевые после черных
+	for i := black; i < black+orange && i < n; i++ {
+		bar[i] = "🟧"
+	}
+	// Желтые после оранжевых
+	for i := black + orange; i < black+orange+yellow && i < n; i++ {
+		bar[i] = "🟨"
+	}
+	// Остальные зеленые
+	for i := 0; i < n; i++ {
+		if bar[i] == "" {
+			bar[i] = "🟩"
+		}
+	}
+	return "[" + strings.Join(bar, "") + "]"
 }
 
-func randomClockEmoji() string {
-	clocks := []string{"🕐", "🕒", "🕕", "🕘", "🕛"}
-	return clocks[rand.Intn(len(clocks))]
+func nextClockEmoji(i int) string {
+	clocks := []string{
+		"🕛", "🕧", "🕐", "🕜", "🕑", "🕝", "🕒", "🕞",
+		"🕓", "🕟", "🕔", "🕠", "🕕", "🕡", "🕖", "🕢",
+		"🕗", "🕣", "🕘", "🕤", "🕙", "🕥", "🕚", "🕦",
+	}
+	return clocks[i%len(clocks)]
 }

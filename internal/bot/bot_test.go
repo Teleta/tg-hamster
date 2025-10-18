@@ -7,6 +7,10 @@ import (
 	"testing"
 )
 
+// -------------------------
+// Тест pickPhrase
+// -------------------------
+
 func TestPickPhrase(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		p := pickPhrase()
@@ -18,6 +22,10 @@ func TestPickPhrase(t *testing.T) {
 		}
 	}
 }
+
+// -------------------------
+// Тест Timeouts
+// -------------------------
 
 func TestTimeoutCommandSetGet(t *testing.T) {
 	to := NewTimeouts()
@@ -34,6 +42,10 @@ func TestTimeoutCommandSetGet(t *testing.T) {
 	_ = os.Remove("test_timeouts.json")
 }
 
+// -------------------------
+// Тест progressBar
+// -------------------------
+
 func TestProgressBar(t *testing.T) {
 	bar := progressBar(10, 5)
 	if len(bar) < 3 {
@@ -41,9 +53,33 @@ func TestProgressBar(t *testing.T) {
 	}
 }
 
+func TestProgressBarBlocks(t *testing.T) {
+	bar := progressBar(10, 7) // done = 3
+	if strings.Count(bar, "█") != 3 {
+		t.Errorf("ожидалось 3 блока '█', получили %d", strings.Count(bar, "█"))
+	}
+	if strings.Count(bar, "░") != 7 {
+		t.Errorf("ожидалось 7 блока '░', получили %d", strings.Count(bar, "░"))
+	}
+}
+
+// -------------------------
+// Тест nextClockEmoji
+// -------------------------
+
 func TestRandomClockEmoji(t *testing.T) {
-	emoji := randomClockEmoji()
+	emoji := nextClockEmoji()
 	if emoji == "" {
 		t.Errorf("emoji пустой")
+	}
+}
+
+func TestRandomClockEmojiValid(t *testing.T) {
+	valid := map[string]bool{"🕐": true, "🕒": true, "🕕": true, "🕘": true, "🕛": true}
+	for i := 0; i < 20; i++ {
+		e := nextClockEmoji()
+		if !valid[e] {
+			t.Errorf("недопустимый emoji: %q", e)
+		}
 	}
 }

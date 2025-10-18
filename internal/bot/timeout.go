@@ -2,9 +2,16 @@ package bot
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"sync"
+)
+
+const (
+	DefaultTimeoutSec = 60
+	MinTimeoutSec     = 5
+	MaxTimeoutSec     = 600
 )
 
 // Timeouts — структура хранения таймаутов по группам.
@@ -21,39 +28,47 @@ func NewTimeouts() *Timeouts {
 }
 
 // Load загружает таймауты из JSON файла.
-func (t *Timeouts) Load(file string, logger *log.Logger) {
+// Возвращает ошибку при проблемах с чтением или парсингом.
+func (t *Timeouts) Load(file string, logger *log.Logger) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	content, err := os.ReadFile(file)
 	if err != nil {
+		if os.IsNotExist(err) {
+			logger.Printf("ℹ️ Файл %s не найден, используем пустой список таймаутов", file)
+			return nil
+		}
 		logger.Printf("⚠️ Не удалось прочитать %s: %v", file, err)
-		return
+		return err
 	}
 
 	if len(content) == 0 {
-		t.Data = make(map[int64]int)
-		return
+		return nil
 	}
 
 	if err := json.Unmarshal(content, &t.Data); err != nil {
 		logger.Printf("⚠️ Ошибка парсинга %s: %v", file, err)
+		return err
 	}
+	return nil
 }
 
 // Save сохраняет таймауты в JSON файл.
-func (t *Timeouts) Save(file string, logger *log.Logger) {
+func (t *Timeouts) Save(file string, logger *log.Logger) error {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
 	content, err := json.MarshalIndent(t.Data, "", "  ")
 	if err != nil {
 		logger.Printf("⚠️ Ошибка сериализации таймаутов: %v", err)
-		return
+		return err
 	}
 	if err := os.WriteFile(file, content, 0644); err != nil {
 		logger.Printf("⚠️ Ошибка записи в %s: %v", file, err)
+		return err
 	}
+	return nil
 }
 
 // Get возвращает таймаут для группы или значение по умолчанию (60 сек)
@@ -63,12 +78,32 @@ func (t *Timeouts) Get(chatID int64) int {
 	if v, ok := t.Data[chatID]; ok {
 		return v
 	}
-	return 60
+	return DefaultTimeoutSec
 }
 
-// Set задаёт таймаут для группы
+// Set задаёт таймаут для группы с ограничением Min/Max
 func (t *Timeouts) Set(chatID int64, seconds int) {
+	if seconds < MinTimeoutSec {
+		seconds = MinTimeoutSec
+	}
+	if seconds > MaxTimeoutSec {
+		seconds = MaxTimeoutSec
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.Data[chatID] = seconds
+}
+
+// Delete удаляет таймаут для группы
+func (t *Timeouts) Delete(chatID int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.Data, chatID)
+}
+
+// String выводит текущие таймауты для отладки
+func (t *Timeouts) String() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return fmt.Sprintf("%v", t.Data)
 }
