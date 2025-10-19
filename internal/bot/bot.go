@@ -569,22 +569,27 @@ func (b *Bot) deleteUserMessagesSince(chatID, userID int64, since time.Time) {
 	})
 }
 
+func removeIf(l *list.List, cond func(e *list.Element) bool) {
+	for e := l.Front(); e != nil; {
+		next := e.Next()
+		if cond(e) {
+			l.Remove(e)
+		}
+		e = next
+	}
+}
+
 func (b *Bot) CleanupOldMessages() {
-	cutoff := time.Now().Add(-60 * time.Second)
+	now := time.Now()
 	b.muMessages.Lock()
 	defer b.muMessages.Unlock()
 
-	for userID, msgs := range b.userMessages {
-		for e := msgs.Front(); e != nil; {
-			next := e.Next()
-			m := e.Value.(cachedMessage)
-			if m.timestamp.Before(cutoff) && (m.isBot || m.isPending) {
-				b.safeDeleteMessage(m.msg.Chat.ID, m.msg.MessageID)
-				msgs.Remove(e)
-			}
-			e = next
-		}
-		if msgs.Len() == 0 {
+	for userID, lst := range b.userMessages {
+		removeIf(lst, func(e *list.Element) bool {
+			cm := e.Value.(cachedMessage)
+			return now.Sub(cm.timestamp) > 60*time.Second
+		})
+		if lst.Len() == 0 {
 			delete(b.userMessages, userID)
 		}
 	}

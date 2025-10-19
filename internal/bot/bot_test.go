@@ -155,14 +155,21 @@ func TestCacheAndCleanupMessages(t *testing.T) {
 	update := Update{UpdateID: 1, Message: &msg}
 	b.cacheMessage(update)
 
+	// Извлекаем элемент и меняем timestamp
 	elem := b.userMessages[42].Front()
 	if elem == nil {
 		t.Fatalf("в списке нет элементов")
 	}
-	elem.Value = cachedMessage{msg: msg, timestamp: time.Now().Add(-61 * time.Second)}
+	elem.Value = cachedMessage{
+		msg:       msg,
+		timestamp: time.Now().Add(-61 * time.Second), // старее 60 секунд
+	}
 
+	// Вызываем очистку
 	b.CleanupOldMessages()
-	if _, ok := b.userMessages[42]; ok {
+
+	// Проверяем список сообщений
+	if l, ok := b.userMessages[42]; ok && l.Len() > 0 {
 		t.Errorf("Сообщение не удалено после истечения времени")
 	}
 }
@@ -171,26 +178,20 @@ func TestCacheAndCleanupMessages(t *testing.T) {
 // Тест handleCallback
 // -------------------------
 func TestHandleCallbackStopsProgress(t *testing.T) {
-	b := &Bot{
-		logger:       NewLogger(),
-		activeTokens: make(map[int64]string),
-		progressStore: struct {
-			mu   sync.Mutex
-			data map[int64]progressData
-		}{data: make(map[int64]progressData)},
+	b := setupBot()
+
+	stop := make(chan struct{})
+	b.progressStore.data[100] = progressData{
+		stopChan:      stop,
+		token:         "TOKEN123",
+		userID:        42,
+		greetMsgID:    100,
+		msgProgressID: 101,
 	}
 
 	var deleted, sent bool
 	b.DeleteMessageFunc = func(chatID, msgID int64) { deleted = true }
 	b.SendSilentFunc = func(chatID int64, text string) int64 { sent = true; return 1 }
-
-	stop := make(chan struct{})
-	b.progressStore.data[100] = progressData{
-		stopChan:   stop,
-		token:      "TOKEN123",
-		userID:     42,
-		greetMsgID: 99,
-	}
 
 	cb := &Callback{
 		Message: &Message{MessageID: 100, Chat: Chat{ID: 1}},
@@ -200,6 +201,14 @@ func TestHandleCallbackStopsProgress(t *testing.T) {
 
 	b.handleCallback(cb)
 
+	select {
+	case <-stop:
+	default:
+		t.Errorf("stopChan не закрыт")
+	}
+
+	b.progressStore.mu.Lock()
+	defer b.progressStore.mu.Unlock()
 	if _, ok := b.progressStore.data[100]; ok {
 		t.Errorf("прогрессбар не удалён после callback")
 	}
@@ -303,4 +312,72 @@ func TestStartProgressbarStopsAndDeletes(t *testing.T) {
 		t.Errorf("прогрессбар не удалён из хранилища")
 	}
 	b.progressStore.mu.Unlock()
+}
+
+// -------------------------
+// progressBar границы
+// -------------------------
+func TestProgressBarBoundaries(t *testing.T) {
+	if got := progressBar(0, 0); !strings.Contains(got, "⬛") {
+		t.Errorf("ожидалось только черные блоки, получили %s", got)
+	}
+	if got := progressBar(5, 10); strings.Count(got, "🟩") != 8 {
+		t.Errorf("слишком много/мало зеленых блоков: %s", got)
+	}
+}
+
+// -------------------------
+// nextClockEmoji границы
+// -------------------------
+func TestNextClockEmojiOverflow(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		e := nextClockEmoji(i)
+		if e == "" {
+			t.Errorf("emoji пустой для i=%d", i)
+		}
+	}
+}
+
+// -------------------------
+// cacheMessage + isUserPending
+// -------------------------
+func TestCacheMessagePendingFlag(t *testing.T) {
+	b := setupBot()
+	userID := int64(1)
+	b.progressStore.data[99] = progressData{userID: userID, stopChan: make(chan struct{})}
+
+	msg := Message{MessageID: 1, Chat: Chat{ID: 1}, From: &User{ID: userID}}
+	b.cacheMessage(Update{Message: &msg})
+
+	elem := b.userMessages[userID].Back()
+	cm := elem.Value.(cachedMessage)
+	if !cm.isPending {
+		t.Error("сообщение пользователя с активным прогрессбаром должно быть pending")
+	}
+}
+
+// -------------------------
+// handleCallback неправильный токен
+// -------------------------
+func TestHandleCallbackWrongToken(t *testing.T) {
+	b := setupBot()
+	userID := int64(1)
+	b.progressStore.data[100] = progressData{
+		userID:     userID,
+		token:      "TOKEN",
+		stopChan:   make(chan struct{}),
+		greetMsgID: 50,
+	}
+	called := false
+	b.SendSilentFunc = func(chatID int64, text string) int64 { called = true; return 1 }
+
+	cb := &Callback{
+		Message: &Message{MessageID: 100, Chat: Chat{ID: 1}},
+		From:    &User{ID: userID},
+		Data:    "click:1:WRONG",
+	}
+	b.handleCallback(cb)
+	if called {
+		t.Error("callback с неправильным токеном не должен отправлять сообщение")
+	}
 }
