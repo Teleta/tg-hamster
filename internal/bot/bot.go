@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -62,6 +63,8 @@ type Bot struct {
 type cachedMessage struct {
 	msg       Message
 	timestamp time.Time
+	isBot     bool
+	isPending bool // для непройденного прогрессбара
 }
 
 type Update struct {
@@ -108,12 +111,13 @@ type progressData struct {
 	token         string
 	userID        int64
 	greetMsgID    int64
-	progressMsgID int64 // добавлено
+	msgProgressID int64 // id сообщения с прогрессбаром (⏳)
 }
 
 // ==========================
 // Конструктор
 // ==========================
+const timeoutSec = 30
 
 func NewBot(token string, timeoutFile string, logger *Logger) *Bot {
 	b := &Bot{
@@ -124,7 +128,7 @@ func NewBot(token string, timeoutFile string, logger *Logger) *Bot {
 		apiURL:       fmt.Sprintf("https://api.telegram.org/bot%s", token),
 		userMessages: make(map[int64]*list.List),
 		activeTokens: make(map[int64]string),
-		httpClient:   &http.Client{Timeout: 10 * time.Second},
+		httpClient:   &http.Client{Timeout: time.Duration(timeoutSec+10) * time.Second},
 		adminCache:   make(map[string]adminCacheEntry),
 	}
 	b.progressStore.data = make(map[int64]progressData)
@@ -139,7 +143,6 @@ func NewBot(token string, timeoutFile string, logger *Logger) *Bot {
 func (b *Bot) StartWithContext(ctx context.Context) {
 	b.logger.Info("🤖 Бот запущен (polling)...")
 	offset := int64(0)
-	timeoutSec := 30 // рекомендуемый timeout для long polling
 
 	for {
 		select {
@@ -149,12 +152,12 @@ func (b *Bot) StartWithContext(ctx context.Context) {
 		default:
 		}
 
-		updates, err := b.safeGetUpdates(ctx, offset, timeoutSec)
+		updates, err := b.safeGetUpdates(ctx, offset)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			b.logger.Warn("getUpdates error: %w", ctx.Err())
+			b.logger.Warn("getUpdates error: %w", err)
 			b.logger.Warn("getUpdates error, retrying...")
 			time.Sleep(1 * time.Second) // можно сделать экспоненциальное backoff
 			continue
@@ -225,8 +228,8 @@ func (b *Bot) handleTimeoutCommand(msg *Message) {
 		return
 	}
 
-	timeoutSec, err := strconv.Atoi(parts[1])
-	if err != nil || timeoutSec < 5 || timeoutSec > 600 {
+	timeoutSecVar, err := strconv.Atoi(parts[1])
+	if err != nil || timeoutSecVar < 5 || timeoutSecVar > 600 {
 		msgID = b.safeSendSilent(msg.Chat.ID, "⚙️ Укажите значение от 5 до 600 секунд")
 		time.AfterFunc(5*time.Second, func() {
 			b.safeDeleteMessage(msg.Chat.ID, msgID)
@@ -234,9 +237,9 @@ func (b *Bot) handleTimeoutCommand(msg *Message) {
 		return
 	}
 
-	b.timeouts.Set(msg.Chat.ID, timeoutSec)
+	b.timeouts.Set(msg.Chat.ID, timeoutSecVar)
 	b.timeouts.Save(b.timeoutFile, b.logger)
-	msgID = b.safeSendSilent(msg.Chat.ID, fmt.Sprintf("✅ Таймаут установлен: %d сек.", timeoutSec))
+	msgID = b.safeSendSilent(msg.Chat.ID, fmt.Sprintf("✅ Таймаут установлен: %d сек.", timeoutSecVar))
 	time.AfterFunc(5*time.Second, func() {
 		b.safeDeleteMessage(msg.Chat.ID, msgID)
 	})
@@ -258,6 +261,7 @@ func (b *Bot) handleJoinMessage(msg *Message) {
 
 		token := randString(8)
 
+		// кнопка подтверждения
 		button := map[string]interface{}{
 			"text":          pickPhrase() + " 👉",
 			"callback_data": fmt.Sprintf("click:%d:%s", user.ID, token),
@@ -266,12 +270,26 @@ func (b *Bot) handleJoinMessage(msg *Message) {
 			"inline_keyboard": [][]interface{}{{button}},
 		}
 
+		// Отправляем приветствие с кнопкой
 		greetMsgID := b.safeSendSilentWithMarkup(msg.Chat.ID,
 			fmt.Sprintf("Привет, %s!\nНажмите кнопку, чтобы подтвердить вход", username),
 			replyMarkup,
 		)
 
-		b.safeDeleteMessage(msg.Chat.ID, msg.MessageID)
+		// Кэшируем приветственное сообщение бота
+		b.muMessages.Lock()
+		if _, ok := b.userMessages[user.ID]; !ok {
+			b.userMessages[user.ID] = list.New()
+		}
+		b.userMessages[user.ID].PushBack(cachedMessage{
+			msg:       Message{MessageID: greetMsgID, Chat: msg.Chat, From: &User{IsBot: true}},
+			timestamp: time.Now(),
+			isBot:     true,
+			isPending: true, // пока прогрессбар не завершён
+		})
+		b.muMessages.Unlock()
+
+		// Запускаем прогрессбар для нового пользователя
 		go b.startProgressbar(msg.Chat.ID, greetMsgID, user.ID, token)
 	}
 }
@@ -281,26 +299,41 @@ func (b *Bot) handleJoinMessage(msg *Message) {
 // ==========================
 
 func (b *Bot) startProgressbar(chatID int64, greetMsgID int64, userID int64, token string) {
-	msgProgressID := b.safeSendSilent(chatID, "⏳")
+	// создаём сообщение с прогрессбаром
+	msgProgressID := b.safeSendSilent(chatID, "⏳⏳⏳⏳⏳⏳⏳⏳")
+
+	// кэшируем сообщение прогрессбара как ботское
+	b.muMessages.Lock()
+	if _, ok := b.userMessages[userID]; !ok {
+		b.userMessages[userID] = list.New()
+	}
+	b.userMessages[userID].PushBack(cachedMessage{
+		msg:       Message{MessageID: msgProgressID, Chat: Chat{ID: chatID}, From: &User{IsBot: true}},
+		timestamp: time.Now(),
+		isBot:     true,
+		isPending: false,
+	})
+	b.muMessages.Unlock()
+
 	stop := make(chan struct{})
 
+	// сохраняем токен
 	b.muTokens.Lock()
 	b.activeTokens[userID] = token
 	b.muTokens.Unlock()
 
+	// сохраняем прогрессбар
 	b.progressStore.mu.Lock()
 	b.progressStore.data[greetMsgID] = progressData{
 		stopChan:      stop,
 		token:         token,
 		userID:        userID,
 		greetMsgID:    greetMsgID,
-		progressMsgID: msgProgressID, // <- сохраняем ID прогресс-сообщения
+		msgProgressID: msgProgressID,
 	}
 	b.progressStore.mu.Unlock()
 
-	b.deleteUserMessages(chatID, userID)
-
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
 	timeout := b.timeouts.Get(chatID)
@@ -310,54 +343,54 @@ func (b *Bot) startProgressbar(chatID int64, greetMsgID int64, userID int64, tok
 	for remaining > 0 {
 		select {
 		case <-stop:
-			b.stopProgressbar(chatID, greetMsgID) // только удаление сообщений
-			return
+			remaining = 0 // кнопка нажата
 		case <-ticker.C:
 			bar := progressBar(timeout, remaining)
-			b.safeEditMessage(chatID, msgProgressID, fmt.Sprintf("⏳ Осталось:\n%s %s", bar, nextClockEmoji(step)))
+			b.safeEditMessage(chatID, msgProgressID, fmt.Sprintf("⏳ Осталось: %s %s", bar, nextClockEmoji(step)))
 			step++
 			remaining--
 		}
 	}
 
-	// Таймер истёк → баним
-	b.safeEditMessage(chatID, msgProgressID, "🚫 Время вышло! Пользователь заблокирован навсегда.")
-
-	if b.BanUserFunc != nil {
-		b.BanUserFunc(chatID, userID)
-	} else {
-		err := b.retryHTTP(func() error {
-			banData := map[string]interface{}{
-				"user_id": userID,
-				"chat_id": chatID,
-			}
-			body, err := json.Marshal(banData)
-			if err != nil {
-				return err
-			}
-			resp, err := b.httpClient.Post(fmt.Sprintf("%s/banChatMember", b.apiURL), "application/json", bytes.NewBuffer(body))
-			if err != nil {
-				return err
-			}
-			defer resp.Body.Close()
-			// Можно проверить успешность через JSON-ответ
-			var res struct {
-				Ok bool `json:"ok"`
-			}
-			if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-				return err
-			}
-			if !res.Ok {
-				return fmt.Errorf("banChatMember returned !ok")
-			}
-			return nil
-		})
-		if err != nil {
-			b.logger.Warn("banChatMember failed after retries: %v", err)
-		}
+	// Завершение прогрессбара
+	b.progressStore.mu.Lock()
+	p, ok := b.progressStore.data[greetMsgID]
+	b.progressStore.mu.Unlock()
+	if !ok {
+		return
 	}
 
-	b.stopProgressbar(chatID, greetMsgID) // удаляем все сообщения
+	// Проверка, была ли нажата кнопка
+	select {
+	case <-p.stopChan:
+		// кнопка нажата — просто удаляем ботские и pending-сообщения
+		b.stopProgressbar(chatID, greetMsgID)
+	default:
+		// таймер истёк — баним пользователя и удаляем только ботские/pending-сообщения
+		b.stopProgressbar(chatID, greetMsgID)
+		if b.BanUserFunc != nil {
+			b.BanUserFunc(chatID, userID)
+		} else {
+			_ = b.retryHTTP(func() (*http.Response, error) {
+				banData := map[string]interface{}{"chat_id": chatID, "user_id": userID}
+				body, _ := json.Marshal(banData)
+				resp, err := b.httpClient.Post(fmt.Sprintf("%s/banChatMember", b.apiURL), "application/json", bytes.NewBuffer(body))
+				if err != nil {
+					return resp, err
+				}
+				defer resp.Body.Close()
+				var res struct {
+					Ok bool `json:"ok"`
+				}
+				_ = json.NewDecoder(resp.Body).Decode(&res)
+				if !res.Ok {
+					return resp, fmt.Errorf("banChatMember returned !ok")
+				}
+				return resp, nil
+			})
+		}
+		b.deletePendingMessages(chatID, userID)
+	}
 }
 
 // ==========================
@@ -366,17 +399,28 @@ func (b *Bot) startProgressbar(chatID int64, greetMsgID int64, userID int64, tok
 
 func (b *Bot) stopProgressbar(chatID int64, greetMsgID int64) {
 	b.progressStore.mu.Lock()
-	defer b.progressStore.mu.Unlock()
-
-	if p, ok := b.progressStore.data[greetMsgID]; ok {
-		p.stopOnce.Do(func() { close(p.stopChan) })
-
-		b.safeDeleteMessage(chatID, p.greetMsgID)
-		b.safeDeleteMessage(chatID, p.progressMsgID)
-
-		delete(b.progressStore.data, greetMsgID)
-		b.removeActiveToken(p.userID)
+	p, ok := b.progressStore.data[greetMsgID]
+	if !ok {
+		b.progressStore.mu.Unlock()
+		return
 	}
+
+	p.stopOnce.Do(func() {
+		close(p.stopChan)
+	})
+
+	delete(b.progressStore.data, greetMsgID)
+	b.progressStore.mu.Unlock()
+
+	// удаляем только ботские сообщения
+	if p.greetMsgID != 0 {
+		b.safeDeleteMessage(chatID, p.greetMsgID)
+	}
+	if p.msgProgressID != 0 {
+		b.safeDeleteMessage(chatID, p.msgProgressID)
+	}
+
+	b.removeActiveToken(p.userID)
 }
 
 func (b *Bot) removeActiveToken(userID int64) {
@@ -401,20 +445,37 @@ func (b *Bot) handleCallback(cb *Callback) {
 	userID, _ := strconv.ParseInt(parts[1], 10, 64)
 	token := parts[2]
 
+	// ищем правильный progressData
 	b.progressStore.mu.Lock()
 	p, ok := b.progressStore.data[cb.Message.MessageID]
+	if !ok {
+		// пробуем найти по greetMsgID (для callback)
+		for _, val := range b.progressStore.data {
+			if val.greetMsgID == cb.Message.MessageID {
+				p = val
+				ok = true
+				break
+			}
+		}
+	}
 	b.progressStore.mu.Unlock()
 	if !ok {
 		return
 	}
 
+	// проверяем пользователя и токен
 	if cb.From.ID != userID || p.token != token {
 		return
 	}
 
-	b.stopProgressbar(cb.Message.Chat.ID, cb.Message.MessageID)
-	b.safeDeleteMessage(cb.Message.Chat.ID, p.greetMsgID)
-	b.safeSendSilent(cb.Message.Chat.ID, fmt.Sprintf("✨ %s, добро пожаловать!", cb.From.FirstName))
+	// останавливаем прогрессбар и удаляем только ботские сообщения
+	b.stopProgressbar(cb.Message.Chat.ID, p.greetMsgID)
+
+	// сообщение пользователю
+	msgID := b.safeSendSilent(cb.Message.Chat.ID, fmt.Sprintf("✨ %s, добро пожаловать!", cb.From.FirstName))
+	time.AfterFunc(60*time.Second, func() {
+		b.safeDeleteMessage(cb.Message.Chat.ID, msgID)
+	})
 }
 
 // ==========================
@@ -422,32 +483,51 @@ func (b *Bot) handleCallback(cb *Callback) {
 // ==========================
 
 func (b *Bot) cacheMessage(u Update) {
-	if u.Message != nil && u.Message.From != nil {
-		b.muMessages.Lock()
-		defer b.muMessages.Unlock()
+	if u.Message == nil || u.Message.From == nil {
+		return
+	}
 
-		userID := u.Message.From.ID
-		if _, ok := b.userMessages[userID]; !ok {
-			b.userMessages[userID] = list.New()
-		}
-		b.userMessages[userID].PushBack(cachedMessage{
-			msg:       *u.Message,
-			timestamp: time.Now(),
-		})
+	userID := u.Message.From.ID
+	b.muMessages.Lock()
+	defer b.muMessages.Unlock()
 
-		cutoff := time.Now().Add(-60 * time.Second)
-		l := b.userMessages[userID]
-		for e := l.Front(); e != nil; {
-			next := e.Next()
-			if e.Value.(cachedMessage).timestamp.Before(cutoff) {
-				l.Remove(e)
-			}
-			e = next
+	if _, ok := b.userMessages[userID]; !ok {
+		b.userMessages[userID] = list.New()
+	}
+
+	cm := cachedMessage{
+		msg:       *u.Message,
+		timestamp: time.Now(),
+		isBot:     u.Message.From.IsBot,
+		isPending: false,
+	}
+
+	// Если пользователь с прогрессбаром — помечаем его сообщения как pending
+	if !cm.isBot && b.isUserPending(userID) {
+		cm.isPending = true
+	}
+
+	b.userMessages[userID].PushBack(cm)
+
+	// Очистка старых сообщений
+	cutoff := time.Now().Add(-60 * time.Second)
+	l := b.userMessages[userID]
+	for e := l.Front(); e != nil; {
+		next := e.Next()
+		if e.Value.(cachedMessage).timestamp.Before(cutoff) {
+			l.Remove(e)
 		}
+		e = next
+	}
+	if l.Len() == 0 {
+		delete(b.userMessages, userID)
 	}
 }
 
-func (b *Bot) deleteUserMessages(chatID, userID int64) {
+// ==========================
+// Удаление сообщений (универсальная функция)
+// ==========================
+func (b *Bot) deleteUserMessagesFiltered(chatID, userID int64, filter func(cachedMessage) bool) {
 	b.muMessages.Lock()
 	defer b.muMessages.Unlock()
 
@@ -456,25 +536,49 @@ func (b *Bot) deleteUserMessages(chatID, userID int64) {
 		return
 	}
 
-	for e := msgs.Front(); e != nil; e = e.Next() {
+	for e := msgs.Front(); e != nil; {
+		next := e.Next()
 		m := e.Value.(cachedMessage)
-		if m.msg.Chat.ID == chatID {
+		if m.msg.Chat.ID == chatID && filter(m) {
 			b.safeDeleteMessage(chatID, m.msg.MessageID)
+			msgs.Remove(e)
 		}
+		e = next
 	}
-	b.userMessages[userID] = list.New()
+
+	if msgs.Len() == 0 {
+		delete(b.userMessages, userID)
+	}
+}
+
+func (b *Bot) deletePendingMessages(chatID, userID int64) {
+	b.deleteUserMessagesFiltered(chatID, userID, func(m cachedMessage) bool {
+		return m.isBot || m.isPending
+	})
+}
+
+func (b *Bot) deleteUserMessages(chatID, userID int64) {
+	b.deleteUserMessagesFiltered(chatID, userID, func(m cachedMessage) bool {
+		return true
+	})
+}
+
+func (b *Bot) deleteUserMessagesSince(chatID, userID int64, since time.Time) {
+	b.deleteUserMessagesFiltered(chatID, userID, func(m cachedMessage) bool {
+		return !m.timestamp.Before(since)
+	})
 }
 
 func (b *Bot) CleanupOldMessages() {
+	cutoff := time.Now().Add(-60 * time.Second)
 	b.muMessages.Lock()
 	defer b.muMessages.Unlock()
 
-	cutoff := time.Now().Add(-60 * time.Second)
 	for userID, msgs := range b.userMessages {
 		for e := msgs.Front(); e != nil; {
 			next := e.Next()
 			m := e.Value.(cachedMessage)
-			if m.timestamp.Before(cutoff) {
+			if m.timestamp.Before(cutoff) && (m.isBot || m.isPending) {
 				b.safeDeleteMessage(m.msg.Chat.ID, m.msg.MessageID)
 				msgs.Remove(e)
 			}
@@ -484,6 +588,19 @@ func (b *Bot) CleanupOldMessages() {
 			delete(b.userMessages, userID)
 		}
 	}
+}
+
+// Проверка, есть ли у пользователя активный прогрессбар
+func (b *Bot) isUserPending(userID int64) bool {
+	b.progressStore.mu.Lock()
+	defer b.progressStore.mu.Unlock()
+
+	for _, p := range b.progressStore.data {
+		if p.userID == userID {
+			return true
+		}
+	}
+	return false
 }
 
 // ==========================
@@ -505,14 +622,20 @@ func randString(n int) string {
 }
 
 // ==========================
-// Retry HTTP-запросов
+// retryHTTP с обработкой 429
 // ==========================
-func (b *Bot) retryHTTP(fn func() error) error {
+func (b *Bot) retryHTTP(fn func() (*http.Response, error)) error {
 	var lastErr error
-	for i := 0; i < 3; i++ { // 3 попытки
-		if err := fn(); err != nil {
+	for i := 0; i < 3; i++ {
+		resp, err := fn()
+		if err != nil {
 			lastErr = err
-			time.Sleep(time.Duration(i+1) * 500 * time.Millisecond) // экспоненциальная задержка
+			time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
+			continue
+		}
+		if resp.StatusCode == 429 {
+			time.Sleep(2 * time.Second)
+			lastErr = fmt.Errorf("429 rate limit")
 			continue
 		}
 		return nil
@@ -524,24 +647,22 @@ func (b *Bot) retryHTTP(fn func() error) error {
 // Безопасные вызовы Telegram API
 // ==========================
 
-func (b *Bot) safeGetUpdates(ctx context.Context, offset int64, timeoutSec int) ([]Update, error) {
+func (b *Bot) safeGetUpdates(ctx context.Context, offset int64) ([]Update, error) {
 	var updates []Update
-
 	url := fmt.Sprintf("%s/getUpdates?offset=%d&timeout=%d", b.apiURL, offset, timeoutSec)
 
-	err := b.retryHTTP(func() error {
+	err := b.retryHTTP(func() (*http.Response, error) {
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		resp, err := b.httpClient.Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
-				// Контекст отменён — возвращаем сразу
-				return ctx.Err()
+				return resp, ctx.Err()
 			}
-			return err
+			return resp, err
 		}
 		defer resp.Body.Close()
 
@@ -549,15 +670,14 @@ func (b *Bot) safeGetUpdates(ctx context.Context, offset int64, timeoutSec int) 
 			Result []Update `json:"result"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-			return err
+			return resp, err
 		}
 		updates = data.Result
-		return nil
+		return resp, nil
 	})
-	if err != nil {
-		if ctx.Err() == nil {
-			b.logger.Warn("safeGetUpdates failed: %v", err)
-		}
+
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		b.logger.Warn("safeGetUpdates failed: %v", err)
 	}
 	return updates, err
 }
@@ -568,7 +688,7 @@ func (b *Bot) safeSendSilent(chatID int64, text string) int64 {
 	}
 
 	var msgID int64
-	err := b.retryHTTP(func() error {
+	err := b.retryHTTP(func() (*http.Response, error) {
 		data := map[string]interface{}{
 			"chat_id":              chatID,
 			"text":                 text,
@@ -576,15 +696,15 @@ func (b *Bot) safeSendSilent(chatID int64, text string) int64 {
 		}
 		body, err := json.Marshal(data)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		resp, err := b.httpClient.Post(fmt.Sprintf("%s/sendMessage", b.apiURL), "application/json", bytes.NewBuffer(body))
 		if err != nil {
-			return err
+			return resp, err
 		}
 		defer resp.Body.Close()
-		msgID = extractMessageID(resp.Body)
-		return nil
+		msgID = b.extractMessageID(resp.Body)
+		return resp, nil
 	})
 	if err != nil {
 		b.logger.Warn("safeSendSilent failed: %v", err)
@@ -598,7 +718,7 @@ func (b *Bot) safeSendSilentWithMarkup(chatID int64, text string, markup interfa
 	}
 
 	var msgID int64
-	err := b.retryHTTP(func() error {
+	err := b.retryHTTP(func() (*http.Response, error) {
 		data := map[string]interface{}{
 			"chat_id":              chatID,
 			"text":                 text,
@@ -607,15 +727,15 @@ func (b *Bot) safeSendSilentWithMarkup(chatID int64, text string, markup interfa
 		}
 		body, err := json.Marshal(data)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		resp, err := b.httpClient.Post(fmt.Sprintf("%s/sendMessage", b.apiURL), "application/json", bytes.NewBuffer(body))
 		if err != nil {
-			return err
+			return resp, err
 		}
 		defer resp.Body.Close()
-		msgID = extractMessageID(resp.Body)
-		return nil
+		msgID = b.extractMessageID(resp.Body)
+		return resp, nil
 	})
 	if err != nil {
 		b.logger.Warn("safeSendSilentWithMarkup failed: %v", err)
@@ -628,7 +748,7 @@ func (b *Bot) safeEditMessage(chatID int64, msgID int64, text string) {
 		b.EditMessageFunc(chatID, msgID, text)
 		return
 	}
-	err := b.retryHTTP(func() error {
+	err := b.retryHTTP(func() (*http.Response, error) {
 		data := map[string]interface{}{
 			"chat_id":    chatID,
 			"message_id": msgID,
@@ -636,14 +756,14 @@ func (b *Bot) safeEditMessage(chatID int64, msgID int64, text string) {
 		}
 		body, err := json.Marshal(data)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		resp, err := b.httpClient.Post(fmt.Sprintf("%s/editMessageText", b.apiURL), "application/json", bytes.NewBuffer(body))
 		if err != nil {
-			return err
+			return resp, err
 		}
 		defer resp.Body.Close()
-		return nil
+		return resp, nil
 	})
 	if err != nil {
 		b.logger.Warn("safeEditMessage failed: %v", err)
@@ -655,21 +775,21 @@ func (b *Bot) safeDeleteMessage(chatID int64, msgID int64) {
 		b.DeleteMessageFunc(chatID, msgID)
 		return
 	}
-	err := b.retryHTTP(func() error {
+	err := b.retryHTTP(func() (*http.Response, error) {
 		data := map[string]interface{}{
 			"chat_id":    chatID,
 			"message_id": msgID,
 		}
 		body, err := json.Marshal(data)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		resp, err := b.httpClient.Post(fmt.Sprintf("%s/deleteMessage", b.apiURL), "application/json", bytes.NewBuffer(body))
 		if err != nil {
-			return err
+			return resp, err
 		}
 		defer resp.Body.Close()
-		return nil
+		return resp, nil
 	})
 	if err != nil {
 		b.logger.Warn("safeDeleteMessage failed: %v", err)
@@ -687,10 +807,10 @@ func (b *Bot) isAdmin(chatID, userID int64) bool {
 	}
 
 	var status string
-	err := b.retryHTTP(func() error {
+	err := b.retryHTTP(func() (*http.Response, error) {
 		resp, err := b.httpClient.Get(fmt.Sprintf("%s/getChatMember?chat_id=%d&user_id=%d", b.apiURL, chatID, userID))
 		if err != nil {
-			return err
+			return resp, err
 		}
 		defer resp.Body.Close()
 
@@ -701,10 +821,10 @@ func (b *Bot) isAdmin(chatID, userID int64) bool {
 			} `json:"result"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return err
+			return resp, err
 		}
 		status = result.Result.Status
-		return nil
+		return resp, nil
 	})
 	if err != nil {
 		b.logger.Warn("isAdmin failed with retry: %v", err)
@@ -713,7 +833,7 @@ func (b *Bot) isAdmin(chatID, userID int64) bool {
 
 	b.adminCache[key] = adminCacheEntry{
 		status:    status,
-		expiresAt: time.Now().Add(5 * time.Minute), // кэш на 5 минут
+		expiresAt: time.Now().Add(30 * time.Minute),
 	}
 
 	return status == "creator" || status == "administrator"
@@ -745,12 +865,16 @@ func nextClockEmoji(i int) string {
 	return clocks[i%len(clocks)]
 }
 
-func extractMessageID(r io.Reader) int64 {
+// ==========================
+// extractMessageID с логированием
+// ==========================
+func (b *Bot) extractMessageID(r io.Reader) int64 {
 	var data struct {
 		Ok     bool    `json:"ok"`
 		Result Message `json:"result"`
 	}
 	if err := json.NewDecoder(r).Decode(&data); err != nil {
+		b.logger.Warn("extractMessageID failed: %v", err)
 		return 0
 	}
 	return data.Result.MessageID
