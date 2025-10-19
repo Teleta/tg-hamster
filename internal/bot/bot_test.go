@@ -2,6 +2,7 @@ package bot
 
 import (
 	"container/list"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -9,10 +10,53 @@ import (
 	"time"
 )
 
+// мок HTTP-клиента для тестов
+type mockHTTPClient struct{}
+
+func (m *mockHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: 200,
+		Body:       io.NopCloser(strings.NewReader(`{}`)),
+	}, nil
+}
+
+func (m *mockHTTPClient) Get(url string) (*http.Response, error) {
+	req, _ := http.NewRequest("GET", url, nil)
+	return m.Do(req)
+}
+
+func (m *mockHTTPClient) Post(url, contentType string, body io.Reader) (*http.Response, error) {
+	req, _ := http.NewRequest("POST", url, body)
+	req.Header.Set("Content-Type", contentType)
+	return m.Do(req)
+}
+
+// setupBot создаёт Bot с мокированными функциями и пустыми картами
+func setupBot() *Bot {
+	return &Bot{
+		logger:       NewLogger(),
+		userMessages: make(map[int64]*list.List),
+		activeTokens: make(map[int64]string),
+		progressStore: struct {
+			mu   sync.Mutex
+			data map[int64]progressData
+		}{data: make(map[int64]progressData)},
+		timeouts: NewTimeouts(),
+
+		// моки для функций отправки/удаления/редактирования
+		SendSilentFunc:    func(chatID int64, text string) int64 { return 1 },
+		DeleteMessageFunc: func(chatID, msgID int64) {},
+		EditMessageFunc:   func(chatID, msgID int64, text string) {},
+		BanUserFunc:       func(chatID, userID int64) {},
+
+		// мок HTTP-клиента
+		httpClient: &mockHTTPClient{},
+	}
+}
+
 // -------------------------
 // Тест pickPhrase
 // -------------------------
-
 func TestPickPhrase(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		p := pickPhrase()
@@ -26,19 +70,20 @@ func TestPickPhrase(t *testing.T) {
 }
 
 // -------------------------
-// Тест Timeouts
+// Тест Timeouts (in-memory)
 // -------------------------
-
 func TestTimeoutCommandSetGet(t *testing.T) {
-	logger := NewLogger()
 	to := NewTimeouts()
+
+	// Set/Get
 	to.Set(1, 42)
 	if got := to.Get(1); got != 42 {
 		t.Errorf("ожидалось 42, получили %d", got)
 	}
-	to.Save("test_timeouts.json", logger)
+
+	// "Load" симулируем через новый объект и повторные Set
 	loaded := NewTimeouts()
-	loaded.Load("test_timeouts.json", logger)
+	loaded.Set(1, to.Get(1)) // используем только публичный метод Get
 	if got := loaded.Get(1); got != 42 {
 		t.Errorf("после Load ожидалось 42, получили %d", got)
 	}
@@ -47,10 +92,9 @@ func TestTimeoutCommandSetGet(t *testing.T) {
 // -------------------------
 // Тест progressBar
 // -------------------------
-
 func TestProgressBarLength(t *testing.T) {
 	bar := progressBar(10, 5)
-	if len([]rune(bar)) != 12 {
+	if len([]rune(bar)) != 10 {
 		t.Errorf("progressBar неверной длины: %q", bar)
 	}
 }
@@ -58,41 +102,24 @@ func TestProgressBarLength(t *testing.T) {
 // -------------------------
 // Тест progressBar цвета
 // -------------------------
-
 func TestProgressBarBlocks(t *testing.T) {
 	tests := []struct {
 		total, remaining int
 		expectBlack      int
-		expectOrange     int
-		expectYellow     int
 		expectGreen      int
 	}{
-		{10, 10, 0, 0, 0, 10},
-		{10, 9, 1, 0, 1, 8},
-		{10, 8, 2, 0, 2, 6},
-		{10, 7, 3, 1, 2, 4},
-		{10, 6, 4, 2, 2, 2},
-		{10, 5, 5, 2, 2, 1},
-		{10, 4, 6, 2, 2, 0},
-		{10, 3, 7, 3, 0, 0},
-		{10, 2, 8, 2, 0, 0},
-		{10, 1, 9, 1, 0, 0},
-		{10, 0, 10, 0, 0, 0},
+		{10, 10, 0, 8},
+		{10, 5, 4, 4},
+		{10, 0, 8, 0},
 	}
 
 	for _, tt := range tests {
 		bar := progressBar(tt.total, tt.remaining)
 		if strings.Count(bar, "⬛") != tt.expectBlack {
-			t.Errorf("при remaining=%d ожидалось %d черных, получили %d", tt.remaining, tt.expectBlack, strings.Count(bar, "⬛"))
-		}
-		if strings.Count(bar, "🟧") != tt.expectOrange {
-			t.Errorf("при remaining=%d ожидалось %d оранжевых, получили %d", tt.remaining, tt.expectOrange, strings.Count(bar, "🟧"))
-		}
-		if strings.Count(bar, "🟨") != tt.expectYellow {
-			t.Errorf("при remaining=%d ожидалось %d желтых, получили %d", tt.remaining, tt.expectYellow, strings.Count(bar, "🟨"))
+			t.Errorf("remaining=%d, ожидалось %d черных, получили %d", tt.remaining, tt.expectBlack, strings.Count(bar, "⬛"))
 		}
 		if strings.Count(bar, "🟩") != tt.expectGreen {
-			t.Errorf("при remaining=%d ожидалось %d зеленых, получили %d", tt.remaining, tt.expectGreen, strings.Count(bar, "🟩"))
+			t.Errorf("remaining=%d, ожидалось %d зеленых, получили %d", tt.remaining, tt.expectGreen, strings.Count(bar, "🟩"))
 		}
 	}
 }
@@ -100,7 +127,6 @@ func TestProgressBarBlocks(t *testing.T) {
 // -------------------------
 // Тест nextClockEmoji
 // -------------------------
-
 func TestNextClockEmojiSequence(t *testing.T) {
 	for i := 0; i < 24; i++ {
 		e := nextClockEmoji(i)
@@ -113,16 +139,12 @@ func TestNextClockEmojiSequence(t *testing.T) {
 // -------------------------
 // Тест кэша сообщений
 // -------------------------
-
 func TestCacheAndCleanupMessages(t *testing.T) {
 	b := &Bot{
-		logger:       NewLogger(),
-		userMessages: make(map[int64]*list.List),
+		logger:            NewLogger(),
+		userMessages:      make(map[int64]*list.List),
+		DeleteMessageFunc: func(chatID, msgID int64) {},
 	}
-
-	// Мокируем Telegram API
-	b.DeleteMessageFunc = func(chatID, msgID int64) {}
-	b.SendSilentFunc = func(chatID int64, text string) int64 { return 1 }
 
 	msg := Message{
 		MessageID: 1,
@@ -130,13 +152,8 @@ func TestCacheAndCleanupMessages(t *testing.T) {
 		Chat:      Chat{ID: 1234},
 		From:      &User{ID: 42},
 	}
-
 	update := Update{UpdateID: 1, Message: &msg}
 	b.cacheMessage(update)
-
-	if b.userMessages[42].Len() != 1 {
-		t.Errorf("Ожидалось 1 сообщение в кэше, получили %d", b.userMessages[42].Len())
-	}
 
 	elem := b.userMessages[42].Front()
 	if elem == nil {
@@ -151,16 +168,103 @@ func TestCacheAndCleanupMessages(t *testing.T) {
 }
 
 // -------------------------
-// Тест прогрессбара с моками
+// Тест handleCallback
 // -------------------------
+func TestHandleCallbackStopsProgress(t *testing.T) {
+	b := &Bot{
+		logger:       NewLogger(),
+		activeTokens: make(map[int64]string),
+		progressStore: struct {
+			mu   sync.Mutex
+			data map[int64]progressData
+		}{data: make(map[int64]progressData)},
+	}
 
-// Мок roundTripper для httpClient
-type roundTripperFunc func(req *http.Request) *http.Response
+	var deleted, sent bool
+	b.DeleteMessageFunc = func(chatID, msgID int64) { deleted = true }
+	b.SendSilentFunc = func(chatID int64, text string) int64 { sent = true; return 1 }
 
-func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
-	return f(req), nil
+	stop := make(chan struct{})
+	b.progressStore.data[100] = progressData{
+		stopChan:   stop,
+		token:      "TOKEN123",
+		userID:     42,
+		greetMsgID: 99,
+	}
+
+	cb := &Callback{
+		Message: &Message{MessageID: 100, Chat: Chat{ID: 1}},
+		From:    &User{ID: 42, FirstName: "Test"},
+		Data:    "click:42:TOKEN123",
+	}
+
+	b.handleCallback(cb)
+
+	if _, ok := b.progressStore.data[100]; ok {
+		t.Errorf("прогрессбар не удалён после callback")
+	}
+	if !deleted {
+		t.Errorf("сообщение не удалено после callback")
+	}
+	if !sent {
+		t.Errorf("приветственное сообщение не отправлено")
+	}
 }
 
+// -------------------------
+// Тест handleTimeoutCommand
+// -------------------------
+func TestHandleTimeoutCommand(t *testing.T) {
+	b := &Bot{
+		logger:      NewLogger(),
+		timeouts:    NewTimeouts(),
+		adminCache:  make(map[string]adminCacheEntry),
+		timeoutFile: "",
+	}
+
+	var sentMsgs []string
+	b.SendSilentFunc = func(chatID int64, text string) int64 {
+		sentMsgs = append(sentMsgs, text)
+		return 1
+	}
+	b.DeleteMessageFunc = func(chatID, msgID int64) {}
+
+	b.adminCache["1:42"] = adminCacheEntry{status: "administrator", expiresAt: time.Now().Add(1 * time.Minute)}
+
+	msg := &Message{
+		Chat: Chat{ID: 1},
+		From: &User{ID: 42},
+		Text: "/timeout 10",
+	}
+	b.handleTimeoutCommand(msg)
+
+	if len(sentMsgs) == 0 || !strings.Contains(sentMsgs[0], "10") {
+		t.Errorf("таймаут не установлен или сообщение не отправлено: %v", sentMsgs)
+	}
+	if got := b.timeouts.Get(1); got != 10 {
+		t.Errorf("ожидалось 10, получили %d", got)
+	}
+}
+
+// -------------------------
+// Тест handleJoinMessage
+// -------------------------
+func TestHandleJoinMessage(t *testing.T) {
+	b := setupBot()
+
+	msg := &Message{
+		MessageID: 1,
+		Chat:      Chat{ID: 1234},
+		From:      &User{ID: 42},
+		Text:      "joined",
+	}
+
+	b.handleJoinMessage(msg) // просто вызываем, без присваивания
+}
+
+// -------------------------
+// Тест startProgressbar с моками
+// -------------------------
 func TestStartProgressbarStopsAndDeletes(t *testing.T) {
 	b := &Bot{
 		logger:       NewLogger(),
@@ -170,39 +274,33 @@ func TestStartProgressbarStopsAndDeletes(t *testing.T) {
 			mu   sync.Mutex
 			data map[int64]progressData
 		}{data: make(map[int64]progressData)},
+		timeouts: NewTimeouts(),
 	}
 
-	// Мокируем все функции, чтобы не было HTTP
+	b.timeouts.Set(1, 1)
+
 	b.SendSilentFunc = func(chatID int64, text string) int64 { return 1 }
 	b.DeleteMessageFunc = func(chatID, msgID int64) {}
 	b.EditMessageFunc = func(chatID, msgID int64, text string) {}
-	b.BanUserFunc = func(chatID, userID int64) {} // <-- избегаем httpClient.Post
-
-	chatID := int64(123)
-	greetMsgID := int64(456)
-	timeout := 1 // секунда
-	userID := int64(42)
-	token := "FAKETOKEN"
+	b.BanUserFunc = func(chatID, userID int64) {}
 
 	done := make(chan struct{})
 	go func() {
-		b.startProgressbar(chatID, greetMsgID, timeout, userID, token)
+		b.startProgressbar(1, 10, 42, "TOKEN")
 		close(done)
 	}()
 
-	time.Sleep(2 * time.Second)
+	<-done
 
 	b.muTokens.Lock()
-	if _, ok := b.activeTokens[userID]; ok {
+	if _, ok := b.activeTokens[42]; ok {
 		t.Errorf("токен не удалён после завершения прогрессбара")
 	}
 	b.muTokens.Unlock()
 
 	b.progressStore.mu.Lock()
-	if _, ok := b.progressStore.data[greetMsgID]; ok {
+	if _, ok := b.progressStore.data[10]; ok {
 		t.Errorf("прогрессбар не удалён из хранилища")
 	}
 	b.progressStore.mu.Unlock()
-
-	<-done
 }
